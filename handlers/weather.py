@@ -301,3 +301,4 @@ async def weather_command(bot, user_id: str, args: str) -> str:
     except Exception as e:
         # В реальном проекте лучше логировать ошибку
         return f"Не удалось получить погоду. Ошибка: {e}"
+    

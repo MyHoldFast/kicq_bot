@@ -714,3 +714,4 @@ class AsyncICQEchoBot:
         if self.active_tasks:
             await asyncio.gather(*self.active_tasks, return_exceptions=True)
         logging.info("Bot stopped")
+

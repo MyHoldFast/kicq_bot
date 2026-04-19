@@ -1,6 +1,7 @@
 from command_handler import admin_only
 def setup(handler):
     handler.register_command("status", status_command)
+    
 @admin_only()
 async def status_command(bot, user_id: str, args: str) -> str:
     parts = args.split(maxsplit=1)

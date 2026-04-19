@@ -1,6 +1,7 @@
 from command_handler import admin_only
 from icq_protocol import XSTATUS_GUIDS
 
+
 def setup(handler):
     handler.register_command("xlist", xlist_command)
 @admin_only()
