@@ -37,13 +37,11 @@ class ChatRoomManager:
         self.user_room: dict[str, str] = {}
         self.user_nick: dict[str, str] = {}
         self.user_last_active: dict[str, float] = {}
-        self.user_last_reminded: dict[str, float] = {}
 
         for name in self.PUBLIC_ROOMS:
             self.rooms[name] = Room(name=name, is_public=True)
 
         self._load_state()
-        self._restore_active_users()
 
     # ── Сохранение состояния ──────────────────────────────────────────────────
 
@@ -54,9 +52,8 @@ class ChatRoomManager:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.user_nick          = data.get("user_nick", {})
-            self.user_last_active   = data.get("user_last_active", {})
-            self.user_last_reminded = data.get("user_last_reminded", {})
+            self.user_nick        = data.get("user_nick", {})
+            self.user_last_active = data.get("user_last_active", {})
 
             for rdata in data.get("rooms", []):
                 name = rdata["name"]
@@ -73,22 +70,9 @@ class ChatRoomManager:
                     self.user_room[uin] = room_name
                     self.rooms[room_name].subscribers[uin] = nick
 
-            logging.info(
-                f"ChatRooms: загружено {len(self.user_room)} подписчиков, "
-                f"{len(self.rooms)} комнат, {len(self.user_last_active)} временных меток"
-            )
+            logging.info(f"ChatRooms: загружено {len(self.user_room)} подписчиков, {len(self.rooms)} комнат")
         except Exception as e:
             logging.error(f"ChatRooms: не удалось загрузить состояние: {e}")
-
-    def _restore_active_users(self):
-        now = time.time()
-        for uin, last_active in self.user_last_active.items():
-            room_name = self.user_room.get(uin)
-            if room_name and room_name in self.rooms:
-                room = self.rooms[room_name]
-                nick = self.user_nick.get(uin, f"User{uin}")
-                if (now - last_active) < IDLE_TIMEOUT:
-                    room.active[uin] = nick
 
     def _save_state(self):
         try:
@@ -102,11 +86,10 @@ class ChatRoomManager:
                 if room.name not in self.PUBLIC_ROOMS
             ]
             data = {
-                "user_nick":          self.user_nick,
-                "user_room":          self.user_room,
-                "user_last_active":   self.user_last_active,
-                "user_last_reminded": self.user_last_reminded,
-                "rooms":              rooms_data,
+                "user_nick":        self.user_nick,
+                "user_room":        self.user_room,
+                "user_last_active": self.user_last_active,
+                "rooms":            rooms_data,
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -115,42 +98,39 @@ class ChatRoomManager:
 
     # ── Активность ────────────────────────────────────────────────────────────
 
-    def touch(self, uin: str):
+    def update_activity(self, uin: str):
+        """Обновляет время последней активности и active статус"""
         now = time.time()
-        self.user_last_active[uin]   = now
-        self.user_last_reminded[uin] = now
+        self.user_last_active[uin] = now
+        
         room = self.current_room(uin)
         if room:
             room.active[uin] = self.get_nick(uin)
+            # Убираем из active тех, кто молчит дольше IDLE_TIMEOUT
+            self._cleanup_idle_users(room)
+        
         self._save_state()
 
-    def check_idle_users(self) -> list[tuple[str, str]]:
-        """Убирает из active тех, кто молчит дольше IDLE_TIMEOUT."""
+    def _cleanup_idle_users(self, room: Room):
+        """Убирает из room.active неактивных пользователей"""
         now = time.time()
-        deactivated = []
-        for uin, room_name in list(self.user_room.items()):
-            last = self.user_last_active.get(uin, 0)
-            room = self.rooms.get(room_name)
-            if room and uin in room.active and (now - last) >= IDLE_TIMEOUT:
-                room.active.pop(uin, None)
-                deactivated.append((uin, room_name))
-        if deactivated:
-            self._save_state()
-        return deactivated
+        to_remove = []
+        for uin, _ in room.active.items():
+            last_active = self.user_last_active.get(uin, 0)
+            if (now - last_active) >= IDLE_TIMEOUT:
+                to_remove.append(uin)
+        
+        for uin in to_remove:
+            room.active.pop(uin, None)
 
-    def check_remind_users(self) -> list[tuple[str, str]]:
-        """Возвращает пользователей, которым пора напомнить о комнате."""
+    def should_send_reminder(self, uin: str) -> bool:
+        """Проверяет, нужно ли отправить напоминание (прошёл час с последней активности)"""
+        if uin not in self.user_room:
+            return False
+        
         now = time.time()
-        to_remind = []
-        for uin, room_name in list(self.user_room.items()):
-            last_active   = self.user_last_active.get(uin, 0)
-            last_reminded = self.user_last_reminded.get(uin, 0)
-            if (now - last_active) >= REMIND_TIMEOUT and (now - last_reminded) >= REMIND_TIMEOUT:
-                to_remind.append((uin, room_name))
-                self.user_last_reminded[uin] = now
-        if to_remind:
-            self._save_state()
-        return to_remind
+        last_active = self.user_last_active.get(uin, 0)
+        return (now - last_active) >= REMIND_TIMEOUT
 
     # ── Никнеймы ──────────────────────────────────────────────────────────────
 
@@ -201,9 +181,7 @@ class ChatRoomManager:
         room.subscribers[uin] = nick
         room.active[uin] = nick
         self.user_room[uin] = room_name
-        now = time.time()
-        self.user_last_active[uin]   = now
-        self.user_last_reminded[uin] = now
+        self.user_last_active[uin] = time.time()
         self._save_state()
         return True, room_name
 
@@ -220,8 +198,6 @@ class ChatRoomManager:
         if room_name and room_name in self.rooms:
             self.rooms[room_name].subscribers.pop(uin, None)
             self.rooms[room_name].active.pop(uin, None)
-        self.user_last_active.pop(uin, None)
-        self.user_last_reminded.pop(uin, None)
 
     def create_room(self, uin: str, room_name: str,
                     password: str = "") -> tuple[bool, str]:
@@ -249,13 +225,19 @@ class ChatRoomManager:
 
     def room_active_members(self, room_name: str) -> list[str]:
         room = self.rooms.get(room_name)
-        return list(room.active.values()) if room else []
+        if not room:
+            return []
+        # При каждом запросе чистим неактивных
+        self._cleanup_idle_users(room)
+        return list(room.active.values())
 
     def list_rooms(self) -> str:
         lines = []
         for name, room in sorted(self.rooms.items()):
             lock   = "" if room.is_public else " 🔒"
             total  = len(room.subscribers)
+            # При каждом запросе чистим неактивных
+            self._cleanup_idle_users(room)
             online = len(room.active)
             lines.append(f"  {name}{lock} ({online} онлайн, {total} в комнате)")
         return "\n".join(lines) if lines else "  (нет комнат)"
@@ -268,9 +250,10 @@ _command_handler = None
 _bot_ref         = None
 
 
-def setup(handler):
-    global _command_handler
+def setup(handler, bot=None):
+    global _command_handler, _bot_ref
     _command_handler = handler
+    _bot_ref = bot
 
     handler.register_command("nick",   nick_command)
     handler.register_command("rooms",  rooms_command)
@@ -286,98 +269,35 @@ def setup(handler):
 
     handler.set_default_handler(chat_message_handler)
 
-    asyncio.get_event_loop().create_task(_idle_checker())
-    asyncio.get_event_loop().create_task(_remind_checker())
-
-
-# ── Фоновые задачи ────────────────────────────────────────────────────────────
-
-async def _idle_checker():
-    """Каждую минуту убирает молчунов из active (без уведомлений в чат)."""
-    while True:
-        await asyncio.sleep(60)
-        try:
-            _manager.check_idle_users()
-        except Exception as e:
-            logging.error(f"Ошибка idle_checker: {e}")
-
-
-async def _remind_checker():
-    """Каждые 10 минут проверяет, кому пора напомнить о комнате (лично)."""
-    while True:
-        await asyncio.sleep(10 * 60)
-        try:
-            to_remind = _manager.check_remind_users()
-            for uin, room_name in to_remind:
-                if not _bot_ref:
-                    continue
-                nick         = _manager.get_nick(uin)
-                online_count = len(_manager.room_active_members(room_name))
-                msg = (
-                    f"👋 Привет, {nick}! Напоминаю, что вы всё ещё в комнате «{room_name}».\n"
-                    f"Сейчас онлайн: {online_count} чел.\n"
-                    f"Напишите что-нибудь или /leave чтобы выйти."
-                )
-                await _bot_ref._send_message(uin, msg)
-                logging.debug(f"ChatRooms: напоминание → {nick} ({uin}) о {room_name}")
-        except Exception as e:
-            logging.error(f"Ошибка remind_checker: {e}")
-
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 async def _broadcast(bot, room_name: str, text: str, exclude_uin: str = None):
-    global _bot_ref
-    if bot:
-        _bot_ref = bot
+    """Рассылает сообщение всем подписчикам комнаты"""
     if not bot:
         return
     targets = [u for u in _manager.room_subscribers(room_name) if u != exclude_uin]
-    logging.debug(f"_broadcast -> {room_name}: {len(targets)} получателей")
     
     for uin in targets:
         await bot._send_message(uin, text)
-        await asyncio.sleep(0.5)  # Задержка 500 мс между сообщениями
-
-
-async def _broadcast_to_active(bot, room_name: str, text: str, exclude_uin: str = None):
-    """Рассылает только активным участникам."""
-    if not bot:
-        return
-    room = _manager.rooms.get(room_name)
-    if not room:
-        return
-    targets = [u for u in list(room.active) if u != exclude_uin]
-    tasks = [bot._send_message(u, text) for u in targets]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.5)
 
 
 async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
-    """
-    Выполняет публичную команду в комнате:
-    1. Анонсирует запрос всем подписчикам (кроме отправителя)
-    2. Выполняет команду
-    3. Рассылает ответ всем подписчикам
-    Возвращает False если пользователь не в комнате.
-    """
+    """Выполняет публичную команду в комнате"""
     room = _manager.current_room(uin)
     if not room:
-        logging.debug(f"_run_public_command_in_room: {uin} не в комнате")
         return False
 
     nick = _manager.get_nick(uin)
-    _manager.touch(uin)
+    _manager.update_activity(uin)
 
-    # Анонсируем запрос всем, КРОМЕ отправителя
     query_text = f"[{room.name}] {nick}: /{command}" + (f" {args}" if args else "")
-    logging.info(f"Public command in {room.name}: {query_text}")
     await _broadcast(bot, room.name, query_text, exclude_uin=uin)
 
     handler_func = _command_handler.commands.get(command) if _command_handler else None
     if handler_func is None:
         answer = f"Команда /{command} не найдена."
-        logging.warning(f"/{command} не найдена в commands")
     else:
         try:
             if asyncio.iscoroutinefunction(handler_func):
@@ -390,7 +310,6 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
 
     if answer:
         response_msg = f"[{room.name}] Ответ для {nick}:\n{answer}"
-        logging.info(f"Public command response in {room.name}: {response_msg[:100]}")
         await _broadcast(bot, room.name, response_msg)
 
     return None
@@ -399,7 +318,6 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
 # ── Обработчики команд ────────────────────────────────────────────────────────
 
 async def qwen_room_command(bot, uin: str, args: str) -> str:
-    """Обёртка над Qwen для использования в комнате как публичной команды."""
     if not args.strip():
         return "Использование: /qwen <вопрос>"
     if not _command_handler or not _command_handler.qwen:
@@ -500,20 +418,33 @@ async def leave_command(bot, uin: str, args: str) -> str:
     return f"Покинули комнату: {room_name}"
 
 
-# ── Обработчик по умолчанию ───────────────────────────────────────────────────
+# ── ОСНОВНОЙ ОБРАБОТЧИК ───────────────────────────────────────────────────────
 
 async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
+    """Обрабатывает сообщения пользователя"""
+    
     if text.startswith("/"):
         parts   = text[1:].split(" ", 1)
         command = parts[0].lower()
         args    = parts[1] if len(parts) > 1 else ""
         return await _run_public_command_in_room(bot, uin, command, args)
-
+    
     room = _manager.current_room(uin)
     if not room:
-        return False
-
-    _manager.touch(uin)
+        await bot._send_message(uin, "Вы не в комнате. Используйте /join <комната> для входа.")
+        return None
+    
     nick = _manager.get_nick(uin)
+    
+    # Проверяем напоминание (прошёл час?)
+    if _manager.should_send_reminder(uin):
+        await bot._send_message(uin, f"{nick}, напоминаем что вы в комнате {room.name}")
+        logging.info(f"Напоминание {nick} ({uin}) о комнате {room.name}")
+    
+    # Отправляем сообщение в комнату
     await _broadcast(bot, room.name, f"[{room.name}] {nick}: {text}", exclude_uin=uin)
+    
+    # Обновляем активность
+    _manager.update_activity(uin)
+    
     return None
