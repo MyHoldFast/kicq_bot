@@ -54,22 +54,28 @@ XSTATUS_GUIDS = {
 }
 
 # ── QIP 2005a Capabilities ─────────────────────────────────────────────────────
-# Главный идентификатор — последние байты это ASCII "QIP 2005a"
 CAP_QIP2005         = bytes.fromhex("563FC8090B6F41514950203230303561")
-# Typing notifications (обязателен для QIP 2005a)
 CAP_TYPING          = bytes.fromhex("563FC8090B6F41BD9F79422609DFA2F3")
-# RTF messages (обязателен для QIP 2005a)
 CAP_RTF             = bytes.fromhex("97B12751243C4334AD22D6ABF73F1492")
-# Server relay
 CAP_AIM_SERVERRELAY = bytes.fromhex("094613494C7F11D18222444553540000")
-# UTF-8 messages
 CAP_UTF8            = bytes.fromhex("0946134E4C7F11D18222444553540000")
-# xTraz (нужен только если хотим отвечать на xTraz-запросы xstatus)
 CAP_XTRAZ           = bytes.fromhex("1A093C6CD7FD4EC59D51A6474E34F5A0")
-# Direct connect (опционально, у QIP 2005a есть)
 CAP_DIRECT          = bytes.fromhex("094613444C7F11D18222444553540000")
-# File transfer (опционально)
 CAP_AIMFILE         = bytes.fromhex("094613434C7F11D18222444553540000")
+
+# ── Known client capabilities ─────────────────────────────────────────────────
+CAP_JIMM    = bytes.fromhex("97B12751243C4334AD22D6ABF73F1409")
+CAP_MIRANDA = bytes.fromhex("4D6972616E64614D61696E0000000000")
+CAP_ICQ6    = bytes.fromhex("3B7248ED5EDE4D6993F729D5BDF8A27F")
+CAP_ICQ7    = bytes.fromhex("3FF19BEB53714657BCDEA39142E55D99")
+
+CLIENT_CAPS = {
+    CAP_QIP2005: "QIP 2005a",
+    CAP_JIMM:    "Jimm",
+    CAP_MIRANDA: "Miranda",
+    CAP_ICQ6:    "ICQ 6",
+    CAP_ICQ7:    "ICQ 7",
+}
 
 STATUS_FLAGS = {
     "online": 0x00000000,
@@ -78,7 +84,7 @@ STATUS_FLAGS = {
     "free":   0x00000020,
 }
 
-# CLI_READY payload — сообщает серверу поддерживаемые семейства и их версии
+# CLI_READY payload
 CLI_READY_DATA = bytes([
     0x00, 0x01, 0x00, 0x04, 0x01, 0x10, 0x16, 0x4f,
     0x00, 0x02, 0x00, 0x01, 0x01, 0x10, 0x16, 0x4f,
@@ -133,6 +139,34 @@ def sanitize_for_icq(text: str, max_bytes: int = ICQ_MAX_MSG_BYTES) -> str:
         truncated = encoded[:max_bytes - suffix_bytes].decode("cp1251", errors="ignore")
         truncated = truncated.rstrip() + suffix
     return truncated
+
+
+# ── Client detection helpers ──────────────────────────────────────────────────
+
+def detect_client_by_caps(caps_blob: bytes) -> str:
+    if not caps_blob:
+        return "Unknown"
+    caps = [
+        caps_blob[i:i+16]
+        for i in range(0, len(caps_blob), 16)
+        if len(caps_blob[i:i+16]) == 16
+    ]
+    for cap in caps:
+        if cap in CLIENT_CAPS:
+            return CLIENT_CAPS[cap]
+    return "Unknown"
+
+
+def parse_userinfo_tlvs(data: bytes) -> dict[int, bytes]:
+    tlvs = {}
+    p = 0
+    while p + 4 <= len(data):
+        t, l = struct.unpack_from("!HH", data, p)
+        if p + 4 + l > len(data):
+            break
+        tlvs[t] = data[p + 4:p + 4 + l]
+        p += 4 + l
+    return tlvs
 
 
 # ── xTraz XML helpers ─────────────────────────────────────────────────────────
@@ -332,6 +366,7 @@ class AsyncICQEchoBot:
         self.active_tasks: set[asyncio.Task] = set()
 
         self._last_recv_time = time.time()
+        self.client_cache: dict[str, str] = {}
 
     # ── Transport ─────────────────────────────────────────────────────────────
 
@@ -413,49 +448,30 @@ class AsyncICQEchoBot:
         await self._send_flap(2, make_snac(fam, sub, payload=payload))
 
     async def _send_cli_families(self):
-        # Proto version 9 соответствует QIP 2005a [ICQ Lite]
         families = [
-            (0x0001, 0x0003),  # Service Controls — version 3 (proto 9)
-            (0x0022, 0x000B),  # Signon — version 11
-            (0x0004, 0x0001),  # ICBM
-            (0x0013, 0x0004),  # SSI
-            (0x0002, 0x0001),  # Location
-            (0x0003, 0x0001),  # Buddy List
-            (0x0015, 0x0001),  # ICQ-specific
-            (0x0006, 0x0001),  # Invitation
-            (0x0009, 0x0001),  # Privacy
-            (0x000a, 0x0001),  # User Lookup
-            (0x000b, 0x0001),  # Stats
+            (0x0001, 0x0003),
+            (0x0022, 0x000B),
+            (0x0004, 0x0001),
+            (0x0013, 0x0004),
+            (0x0002, 0x0001),
+            (0x0003, 0x0001),
+            (0x0015, 0x0001),
+            (0x0006, 0x0001),
+            (0x0009, 0x0001),
+            (0x000a, 0x0001),
+            (0x000b, 0x0001),
         ]
         payload = b"".join(struct.pack("!HH", fam, ver) for fam, ver in families)
         await self._send_snac(0x0001, 0x0017, payload)
 
     async def _send_cli_setuserinfo(self):
-        """
-        Отправляет capabilities, которые идентифицируют клиент как QIP 2005a.
-
-        Обязательный набор по clients.xml (QIP 2005a [ICQ Lite], proto version 9):
-          - CAP_QIP2005  (563FC809...QIP 2005a) — главный идентификатор
-          - CAP_TYPING   (563FC809...BD...) — typing notifications
-          - CAP_RTF      (97B12751...)       — RTF messages
-          - CAP_AIM_SERVERRELAY             — server relay
-          - CAP_UTF8                        — UTF-8
-
-        Намеренно НЕ включаем:
-          - CAP_XTRAZ   — присутствие выдаёт не-QIP профиль при детекте
-          - CAP_DIRECT  — нет в QIP 2005a [ICQ Lite]
-          - CAP_AIMFILE — нет в QIP 2005a [ICQ Lite]
-          - icq_lite, multi_chat — исключены явно в clients.xml
-
-        xstatus_guid добавляется динамически, если установлен xstatus.
-        """
         full_caps = [
-            CAP_QIP2005,            # "QIP 2005a" — основной fingerprint
-            CAP_TYPING,             # typing notifications
-            CAP_XTRAZ,              # xTraz support
-            CAP_RTF,                # RTF messages
-            CAP_AIM_SERVERRELAY,    # server relay (09461349...)
-            CAP_UTF8,               # UTF-8 (0946134E...)
+            CAP_QIP2005,
+            CAP_TYPING,
+            CAP_XTRAZ,
+            CAP_RTF,
+            CAP_AIM_SERVERRELAY,
+            CAP_UTF8,
         ]
         if self.xstatus_guid:
             full_caps.append(self.xstatus_guid)
@@ -477,20 +493,14 @@ class AsyncICQEchoBot:
                                      0x00, 0x00, 0x00, 0x00]))
 
     async def _send_cli_setdcinfo(self):
-        """
-        DC Info для QIP 2005a:
-          dc_info2 = 0x0000000E
-          dc_info3 = 0x0000000F
-        Именно эти значения используются в clients.xml для детекта QIP 2005a.
-        """
         dc = bytearray()
-        dc += struct.pack("!I", 0x00000000)   # External IP
-        dc += struct.pack("!I", 0x00000000)   # Port
-        dc += b"\x02"                          # DC type: DC_WEB
-        dc += struct.pack("!H", 0x0008)        # DC version
-        dc += struct.pack("!I", 0x00000000)    # DC cookie
-        dc += struct.pack("!I", 0x0000000E)    # dc_info2 — QIP 2005a marker
-        dc += struct.pack("!I", 0x0000000F)    # dc_info3 — QIP 2005a marker
+        dc += struct.pack("!I", 0x00000000)
+        dc += struct.pack("!I", 0x00000000)
+        dc += b"\x02"
+        dc += struct.pack("!H", 0x0008)
+        dc += struct.pack("!I", 0x00000000)
+        dc += struct.pack("!I", 0x0000000E)
+        dc += struct.pack("!I", 0x0000000F)
         dc += struct.pack("!I", 0x00000000)
         dc += struct.pack("!I", 0x00000000)
         dc += struct.pack("!I", 0x00000000)
@@ -539,8 +549,8 @@ class AsyncICQEchoBot:
         dc += b"\x02"
         dc += struct.pack("!H", 0x0008)
         dc += struct.pack("!I", 0x00000000)
-        dc += struct.pack("!I", 0x0000000E)   # QIP 2005a marker
-        dc += struct.pack("!I", 0x0000000F)   # QIP 2005a marker
+        dc += struct.pack("!I", 0x0000000E)
+        dc += struct.pack("!I", 0x0000000F)
         dc += struct.pack("!I", 0x00000000)
         dc += struct.pack("!I", 0x00000000)
         dc += struct.pack("!I", 0x00000000)
@@ -594,102 +604,217 @@ class AsyncICQEchoBot:
         await self.update_xstatus()
         logging.info(f"XStatus set to {name}")
 
+    # ── SNAC handler for client detection ─────────────────────────────────────
+
+    async def _handle_snac(self, data: bytes):
+        if len(data) < 10:
+            return
+
+        fam, sub = struct.unpack_from("!HH", data, 0)
+
+        if fam == 0x0003 and sub == 0x000B:
+            try:
+                pos = 10
+                uin_len = data[pos]
+                pos += 1
+                uin = data[pos:pos + uin_len].decode("ascii", errors="ignore")
+                pos += uin_len
+                warning_level = struct.unpack_from("!H", data, pos)[0]
+                pos += 2
+                tlv_count = struct.unpack_from("!H", data, pos)[0]
+                pos += 2
+                tlvs = parse_userinfo_tlvs(data[pos:])
+                caps = tlvs.get(0x000D)
+                client = detect_client_by_caps(caps)
+
+                # Сохраняем только если определили (не "Unknown") или ещё нет записи
+                if client != "Unknown" or uin not in self.client_cache:
+                    self.client_cache[uin] = client
+                    logging.info(f"[CLIENT] {uin}: {client}")
+            except Exception as e:
+                logging.error(f"USER_ONLINE parse error: {e}")
+
     # ── xTraz methods ─────────────────────────────────────────────────────────
 
+    async def _send_xtraz_qip_variant(self, to_uin: str, title: str, desc: str):
+        xml_inner = (mangle_xml("<ret event='OnRemoteNotification'>") +
+                    mangle_xml(
+                        "<srv><id>cAwaySrv</id><val srv_id='cAwaySrv'>"
+                        "<Root><CASXtraSetAwayMessage></CASXtraSetAwayMessage>"
+                        f"<uin>{self.uin}</uin><index>1</index>"
+                        f"<title>{mangle_xml(title)}</title>"
+                        f"<desc>{mangle_xml(desc)}</desc>"
+                        "</Root></val></srv></ret>"
+                    ))
+        xml_raw = f"<NR><RES>{xml_inner}</RES></NR>"
+        xml_bytes = xml_raw.encode("utf-8")
+
+        xml_len = len(xml_bytes)
+        writeutf_bytes = struct.pack("!H", xml_len) + xml_bytes
+        j = len(writeutf_bytes)
+
+        uin_b = to_uin.encode("ascii")
+        ts = int(time.time() * 1000) & 0xFFFFFFFF
+        counter = int(time.time()) & 0xFFFF
+
+        buf = bytearray(len(uin_b) + 180 + j)
+        pos = 0
+
+        def put_be(off, val): struct.pack_into("!H", buf, off, val); return off + 2
+        def put_le(off, val): struct.pack_into("<H", buf, off, val); return off + 2
+        def put_dword_le(off, val): struct.pack_into("<I", buf, off, val); return off + 4
+        def put_byte(off, val): struct.pack_into("B", buf, off, val); return off + 1
+
+        pos = put_dword_le(pos, ts)
+        pos = put_dword_le(pos, ts)
+        pos = put_be(pos, 0x0002)
+        pos = put_byte(pos, len(uin_b))
+        buf[pos:pos+len(uin_b)] = uin_b; pos += len(uin_b)
+        pos = put_be(pos, 0x0003)
+        pos = put_le(pos, 27)
+        pos = put_byte(pos, 0x08)
+        pos += 16
+        pos = put_dword_le(pos, 3)
+        pos = put_dword_le(pos, 4)
+        pos = put_le(pos, counter)
+        pos = put_le(pos, 14)
+        pos = put_le(pos, counter)
+        pos += 12
+
+        pos = put_byte(pos, 26)
+        pos = put_byte(pos, 0)
+        pos = put_le(pos, 0)
+        pos = put_be(pos, 0)
+        pos = put_le(pos, 0x0001)
+        pos = put_byte(pos, 0x00)
+
+        pos = put_le(pos, 79)
+        magic = bytes.fromhex("efb3603b456c2ad85a9ce0a465e8675e")
+        buf[pos:pos+16] = magic; pos += 16
+        pos = put_le(pos, 8)
+        pos = put_dword_le(pos, 42)
+        script_str = b"Script Plug-in: Remote Notification Arrive"
+        buf[pos:pos+42] = script_str; pos += 42
+        pos = put_dword_le(pos, 256)
+        pos = put_dword_le(pos, 0)
+        pos = put_dword_le(pos, 0)
+        pos = put_be(pos, 0)
+        pos = put_byte(pos, 0)
+        pos = put_be(pos, 0x0005)
+
+        pos = put_le(pos, j + 4)
+        pos = put_le(pos, j)
+        buf[pos:pos+j] = writeutf_bytes
+        pos += j
+
+        payload = bytes(buf[:pos])
+        await self._send_flap(2, make_snac(0x0004, 0x000B, flags=0, reqid=0, payload=payload))
+        logging.debug(f"xTraz QIP variant sent to {to_uin}")
+
+    async def _send_xtraz_jasmine_variant(self, to_uin: str, title: str, desc: str):
+        safe_title = mangle_xml(title)
+        safe_desc  = mangle_xml(desc)
+
+        inner_xml = (
+            "<ret event='OnRemoteNotification'>"
+            "<srv><id>cAwaySrv</id><val srv_id='cAwaySrv'>"
+            "<Root><CASXtraSetAwayMessage></CASXtraSetAwayMessage>"
+            f"<uin>{self.uin}</uin><index>1</index>"
+            f"<title>{safe_title}</title>"
+            f"<desc>{safe_desc}</desc>"
+            "</Root></val></srv></ret>"
+        )
+        xml_raw   = f"<NR><RES>{mangle_xml(inner_xml)}</RES></NR>"
+        xml_bytes = xml_raw.encode("cp1251")
+        
+        j = len(xml_bytes) + 2
+        writeutf_bytes = struct.pack("!H", len(xml_bytes)) + xml_bytes
+
+        uin_b = to_uin.encode("ascii")
+        ts = int(time.time() * 1000) & 0xFFFFFFFF
+        counter = int(time.time()) & 0xFFFF
+
+        buf = bytearray(len(uin_b) + 200 + j)
+        pos = 0
+
+        def put_be(off, val): struct.pack_into("!H", buf, off, val); return off + 2
+        def put_le(off, val): struct.pack_into("<H", buf, off, val); return off + 2
+        def put_dword_le(off, val): struct.pack_into("<I", buf, off, val); return off + 4
+        def put_byte(off, val): struct.pack_into("B", buf, off, val); return off + 1
+
+        pos = put_dword_le(pos, ts)
+        pos = put_dword_le(pos, ts)
+        pos = put_be(pos, 0x0002)
+        pos = put_byte(pos, len(uin_b))
+        buf[pos:pos+len(uin_b)] = uin_b; pos += len(uin_b)
+        pos = put_be(pos, 0x0003)
+        pos = put_le(pos, 27)
+        pos = put_byte(pos, 0x08)
+        pos += 16
+        pos = put_dword_le(pos, 3)
+        pos = put_dword_le(pos, 4)
+        pos = put_le(pos, counter)
+        pos = put_le(pos, 14)
+        pos = put_le(pos, counter)
+        pos += 12
+
+        pos = put_byte(pos, 26) 
+        pos = put_byte(pos, 0)
+        pos = put_le(pos, 0)
+        pos = put_be(pos, 0)
+        pos = put_le(pos, 0x0001)
+        pos = put_byte(pos, 0x00)
+
+        pos = put_le(pos, 79)
+        magic = bytes.fromhex("efb3603b456c2ad85a9ce0a465e8675e")
+        buf[pos:pos+16] = magic; pos += 16
+        pos = put_dword_le(pos, 8)
+        pos = put_dword_le(pos, 42)
+        script_str = b"Script Plug-in: Remote Notification Arrive"
+        buf[pos:pos+42] = script_str; pos += 42
+        pos = put_dword_le(pos, 256)
+        pos = put_dword_le(pos, 0)
+        pos = put_dword_le(pos, 0)
+        pos = put_be(pos, 0)
+        pos = put_byte(pos, 0)
+        pos = put_be(pos, 0x0005)
+
+        pos = put_dword_le(pos, j)
+        buf[pos:pos+j] = writeutf_bytes
+        pos += j
+
+        payload = bytes(buf[:pos])
+        await self._send_flap(2, make_snac(0x0004, 0x000B, flags=0, reqid=0, payload=payload))
+        logging.debug(f"xTraz Jasmine variant sent to {to_uin}")
+
     async def _send_xtraz_response(self, to_uin: str, title: str, desc: str):
+        """Отправляет xTraz-ответ: QIP-вариант всегда, Jasmine-вариант — только не-QIP клиентам."""
+        if not title and not desc:
+            title = " "
+            desc = " "
+
+        client = self.client_cache.get(to_uin, "Unknown")
+        is_qip = client.lower().startswith("qip")
+
         try:
-            xml_inner = mangle_xml("<ret event='OnRemoteNotification'>") + \
-                mangle_xml(
-                    "<srv><id>cAwaySrv</id><val srv_id='cAwaySrv'>"
-                    "<Root><CASXtraSetAwayMessage></CASXtraSetAwayMessage>"
-                    f"<uin>{self.uin}</uin><index>1</index>"
-                    f"<title>{title}</title>"
-                    f"<desc>{desc}</desc>"
-                    "</Root></val></srv></ret>"
-                )
-            xml_raw = f"<NR><RES>{xml_inner}</RES></NR>"
-            xml_bytes = xml_raw.encode("utf-8")
+            # QIP-вариант отправляем всегда
+            try:
+                await self._send_xtraz_qip_variant(to_uin, title, desc)
+            except Exception as e:
+                logging.warning(f"Failed to send QIP xTraz variant: {e}")
 
-            xml_len = len(xml_bytes)
-            writeutf_bytes = struct.pack("!H", xml_len) + xml_bytes
-            j = len(writeutf_bytes)
+            # Jasmine-вариант отправляем только НЕ-QIP клиентам
+            if not is_qip:
+                await asyncio.sleep(0.05)
+                try:
+                    await self._send_xtraz_jasmine_variant(to_uin, title, desc)
+                except Exception as e:
+                    logging.warning(f"Failed to send Jasmine xTraz variant: {e}")
 
-            uin_b = to_uin.encode("ascii")
-            ts = int(time.time() * 1000) & 0xFFFFFFFF
-            counter = int(time.time()) & 0xFFFF
-
-            buf = bytearray(len(uin_b) + 160 + j)
-            pos = 0
-
-            def put_be(off, val):
-                struct.pack_into("!H", buf, off, val)
-                return off + 2
-
-            def put_le(off, val):
-                struct.pack_into("<H", buf, off, val)
-                return off + 2
-
-            def put_dword_le(off, val):
-                struct.pack_into("<I", buf, off, val)
-                return off + 4
-
-            def put_byte(off, val):
-                struct.pack_into("B", buf, off, val)
-                return off + 1
-
-            pos = put_dword_le(pos, ts)
-            pos = put_dword_le(pos, ts)
-
-            pos = put_be(pos, 0x0002)
-            pos = put_byte(pos, len(uin_b))
-            buf[pos:pos+len(uin_b)] = uin_b
-            pos += len(uin_b)
-
-            pos = put_be(pos, 0x0003)
-            pos = put_le(pos, 27)
-            pos = put_byte(pos, 0x08)
-            pos += 16
-            pos = put_dword_le(pos, 3)
-            pos = put_dword_le(pos, 4)
-            pos = put_le(pos, counter)
-            pos = put_le(pos, 14)
-            pos = put_le(pos, counter)
-            pos += 12
-            pos = put_byte(pos, 26)
-            pos = put_byte(pos, 0)
-            pos = put_le(pos, 0)
-            pos = put_be(pos, 0)
-
-            pos = put_le(pos, 0x0001)
-            pos = put_byte(pos, 0x00)
-
-            pos = put_le(pos, 79)
-            magic = bytes.fromhex("efb3603b456c2ad85a9ce0a465e8675e")
-            buf[pos:pos+16] = magic
-            pos += 16
-            pos = put_le(pos, 8)
-            pos = put_dword_le(pos, 42)
-            script_str = b"Script Plug-in: Remote Notification Arrive"
-            buf[pos:pos+42] = script_str
-            pos += 42
-            pos = put_dword_le(pos, 256)
-            pos = put_dword_le(pos, 0)
-            pos = put_dword_le(pos, 0)
-            pos = put_be(pos, 0)
-            pos = put_byte(pos, 0)
-
-            pos = put_be(pos, 0x0005)
-            pos = put_le(pos, j + 4)
-            pos = put_le(pos, j)
-            buf[pos:pos+j] = writeutf_bytes
-            pos += j
-
-            payload = bytes(buf[:pos])
-            await self._send_flap(2, make_snac(0x0004, 0x000B, flags=0, reqid=0, payload=payload))
-            logging.info(f"xTraz response sent to {to_uin}: '{title}'")
+            logging.info(f"xTraz response sent to {to_uin} (client={client}): '{title}'")
 
         except Exception as e:
-            logging.error(f"Failed to send xTraz response: {e}", exc_info=True)
+            logging.error(f"Critical error in _send_xtraz_response: {e}", exc_info=True)
 
     def set_xtraz_text(self, title: str, desc: str):
         self.xstatus_title = title
@@ -817,6 +942,7 @@ class AsyncICQEchoBot:
             try:
                 ch, _, body = await self._recv_flap()
                 if ch == 2:
+                    await self._handle_snac(body)
                     await self._handle_incoming_message(body)
                 elif ch == 4:
                     logging.warning("Server sent disconnect (channel 4)")

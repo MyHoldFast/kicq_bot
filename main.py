@@ -22,7 +22,7 @@ async def main():
     bot = AsyncICQEchoBot(SERVER, PORT, UIN, PASSWORD)
 
     bot.current_xstatus = "beer"
-    bot.set_xtraz_text("На меня глядит игриво...", "Пиво пиво пиво пиво")
+    bot.set_xtraz_text("На пиве", "Адихаю")
     bot.xstatus_guid = bytes.fromhex(XSTATUS_GUIDS[bot.current_xstatus])
     
 

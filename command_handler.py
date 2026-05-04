@@ -5,6 +5,8 @@ import asyncio
 import logging
 from typing import Dict, Callable, Optional, Set
 
+###TODO сообщения на / в личке - нет команды, а в чате так слать
+
 _DB_DIR       = "db"
 _SEEN_DB_PATH = os.path.join(_DB_DIR, "seen_users.json")
 
