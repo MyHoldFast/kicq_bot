@@ -1,7 +1,15 @@
 from command_handler import admin_only
+
+
 def setup(handler):
-    handler.register_command("status", status_command)
-    
+    handler.register_command(
+        "status",
+        status_command,
+        help_text="/status [online|away|dnd|free] [текст] — статус бота",
+        group="Администратор"
+    )
+
+
 @admin_only()
 async def status_command(bot, user_id: str, args: str) -> str:
     parts = args.split(maxsplit=1)

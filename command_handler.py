@@ -10,28 +10,6 @@ from typing import Dict, Callable, Optional, Set
 _DB_DIR       = "db"
 _SEEN_DB_PATH = os.path.join(_DB_DIR, "seen_users.json")
 
-WELCOME_AND_HELP = """\
-Привет! Я бот на базе Qwen AI.
-Просто пиши мне - отвечу как обычному собеседнику.
-Или используй команды:
-
-/help - эта справка
-/clear - забыть историю разговора с Qwen
-/weather Москва - погода (город запомнится)
-
-Чат-комнаты:
-/nick <имя> - установить имя в чате
-/rooms - какие есть комнаты
-/join <комната> [пароль] - зайти в комнату
-/create <комната> [пароль] - создать свою комнату
-/who - кто сейчас в комнате
-/leave - выйти из комнаты
-
-В личке Qwen отвечает сам.
-В комнате: /qwen <вопрос>
-/weather <город>
-"""
-
 
 def _load_seen_users() -> set:
     try:
@@ -62,11 +40,67 @@ class CommandHandler:
         self.active_requests: Dict[str, asyncio.Task] = {}
         self.room_public_commands: Set[str] = set()
 
+        # Реестр справки: команда -> (краткое описание, группа)
+        self._help_entries: Dict[str, tuple] = {}
+        self._help_groups: Dict[str, list] = {}
+
         self._seen_users: set = _load_seen_users()
         logging.info(f"Seen users loaded: {len(self._seen_users)} entries")
 
-    def register_command(self, command: str, handler: Callable):
+    def register_command(self, command: str, handler: Callable,
+                         help_text: str = None, group: str = "Прочее"):
+        """
+        Регистрирует команду.
+        help_text — строка вида "/<команда> [аргументы] — описание"
+        group     — название группы в /help
+        """
         self.commands[command] = handler
+        if help_text:
+            self._help_entries[command] = (help_text, group)
+            self._help_groups.setdefault(group, [])
+            if command not in self._help_groups[group]:
+                self._help_groups[group].append(command)
+
+    def build_help_text(self) -> str:
+        """Собирает общий /help из зарегистрированных описаний."""
+        # Определённый порядок групп
+        group_order = [
+            "Основные",
+            "Чат-комнаты",
+            "Погода",
+            "Игры",
+            "Утилиты",
+            "Прочее",
+            "Администратор",
+        ]
+
+        lines = ["Доступные команды:\n"]
+
+        seen_groups = set()
+
+        # Сначала группы в заданном порядке
+        for group in group_order:
+            if group in self._help_groups:
+                seen_groups.add(group)
+                lines.append(f"{group}:")
+                for cmd in self._help_groups[group]:
+                    text, _ = self._help_entries[cmd]
+                    lines.append(f"  {text}")
+                lines.append("")
+
+        # Потом всё остальное
+        for group, cmds in self._help_groups.items():
+            if group not in seen_groups:
+                lines.append(f"{group}:")
+                for cmd in cmds:
+                    text, _ = self._help_entries[cmd]
+                    lines.append(f"  {text}")
+                lines.append("")
+
+        lines.append("Qwen отвечает сам, когда пишете в личку.")
+        lines.append("В общей комнате: /qwen <вопрос>")
+        lines.append("/weather <город>")
+        return "\n".join(lines).strip()
 
     def set_default_handler(self, handler: Callable):
         self.default_handler = handler
@@ -124,7 +158,7 @@ class CommandHandler:
 
     async def handle_message_async(self, bot, user_id: str, message: str) -> Optional[str]:
         if self._is_new_user(user_id):
-            return WELCOME_AND_HELP
+            return self.build_help_text()
 
         if message.startswith('/'):
             parts   = message[1:].split(' ', 1)
@@ -183,7 +217,7 @@ def admin_only(func=None):
             return await f(bot, user_id, args)
         wrapper.__wrapped__ = f
         return wrapper
-    
+
     if func is not None:
         return decorator(func)
     return decorator

@@ -89,6 +89,7 @@ class ChatRoomManager:
 
     def _save_state(self):
         try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             rooms_data = [
                 {
                     "name":          room.name,
@@ -167,7 +168,7 @@ class ChatRoomManager:
         self._save_state()
         return None
 
-    # ── Операции с комнатами ──────────────────────────────────────────────────
+    # ── Операции с комнатами (API для команд) ─────────────────────────────────
 
     def current_room(self, uin: str) -> Optional[Room]:
         name = self.user_room.get(uin)
@@ -190,8 +191,6 @@ class ChatRoomManager:
         room.subscribers[uin] = nick
         room.active[uin] = nick
         self.user_room[uin] = room_name
-        # last_active не ставим при входе: напоминание сработает только
-        # после того, как пользователь реально написал в комнату.
         self._save_state()
         return True, room_name
 
@@ -240,11 +239,31 @@ class ChatRoomManager:
     def list_rooms(self) -> str:
         lines = []
         for name, room in sorted(self.rooms.items()):
-            lock   = "" if room.is_public else " 🔒"
+            lock   = " 🔒" if not room.is_public else ""
             total  = len(room.subscribers)
             online = len(room.active)
             lines.append(f"  {name}{lock} ({online} онлайн, {total} в комнате)")
         return "\n".join(lines) if lines else "  (нет комнат)"
+
+    # ── API для совместимости со скелетом rooms.py ───────────────────────────
+
+    def get_room_info(self, room_name: str) -> Optional[dict]:
+        """Возвращает информацию о комнате для /rooms команды."""
+        room = self.rooms.get(room_name)
+        if not room:
+            return None
+        return {
+            "name": room.name,
+            "password": room.password_hash is not None,
+            "members": len(room.subscribers),
+        }
+
+    def get_current_room_members(self, uin: str) -> Optional[list[str]]:
+        """Возвращает список ников участников комнаты, где находится uin."""
+        room = self.current_room(uin)
+        if not room:
+            return None
+        return list(room.subscribers.values())
 
 
 # ── Модуль ────────────────────────────────────────────────────────────────────
@@ -258,14 +277,30 @@ def setup(handler):
     global _command_handler
     _command_handler = handler
 
-    handler.register_command("nick",   nick_command)
-    handler.register_command("rooms",  rooms_command)
-    handler.register_command("join",   join_command)
-    handler.register_command("create", create_command)
-    handler.register_command("who",    who_command)
-    handler.register_command("leave",  leave_command)
-    handler.register_command("qwen",   qwen_room_command)
+    # Регистрируем команды в соответствии со скелетом rooms.py
+    handler.register_command("nick",   nick_command,
+                            help_text="/nick <имя> — установить имя в чате",
+                            group="Чат-комнаты")
+    handler.register_command("rooms",  rooms_command,
+                            help_text="/rooms — список доступных комнат",
+                            group="Чат-комнаты")
+    handler.register_command("join",   join_command,
+                            help_text="/join <комната> [пароль] — зайти в комнату",
+                            group="Чат-комнаты")
+    handler.register_command("create", create_command,
+                            help_text="/create <комната> [пароль] — создать комнату",
+                            group="Чат-комнаты")
+    handler.register_command("who",    who_command,
+                            help_text="/who — кто сейчас в комнате",
+                            group="Чат-комнаты")
+    handler.register_command("leave",  leave_command,
+                            help_text="/leave — выйти из комнаты",
+                            group="Чат-комнаты")
+    handler.register_command("qwen",   qwen_room_command,
+                            help_text="/qwen <вопрос> — спросить у Qwen (видно всем в комнате)",
+                            group="Чат-комнаты")
 
+    # Публичные команды, которые можно использовать внутри комнаты
     handler.room_public_commands.add("weather")
     handler.room_public_commands.add("qwen")
     logging.info(f"ChatRooms: room_public_commands = {handler.room_public_commands}")
@@ -290,6 +325,7 @@ async def _idle_checker():
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 async def _broadcast(bot, room_name: str, text: str, exclude_uin: str = None):
+    """Расслыка сообщения всем подписчикам комнаты (включая неактивных)."""
     global _bot_ref
     if bot:
         _bot_ref = bot
@@ -299,11 +335,11 @@ async def _broadcast(bot, room_name: str, text: str, exclude_uin: str = None):
     logging.debug(f"_broadcast -> {room_name}: {len(targets)} получателей")
     for uin in targets:
         await bot._send_message(uin, text)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.05)  # небольшая задержка, чтобы не флудить
 
 
 async def _broadcast_to_active(bot, room_name: str, text: str, exclude_uin: str = None):
-    """Рассылает только активным участникам."""
+    """Расслыкает только активным участникам (кто писал в последние 5 минут)."""
     if not bot:
         return
     room = _manager.rooms.get(room_name)
@@ -354,7 +390,7 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
         logging.info(f"Public command response in {room.name}: {response_msg[:100]}")
         await _broadcast(bot, room.name, response_msg)
 
-    return None
+    return None  # возвращаем None, т.к. ответ уже разослан
 
 
 # ── Обработчики команд ────────────────────────────────────────────────────────
@@ -368,6 +404,7 @@ async def qwen_room_command(bot, uin: str, args: str) -> str:
 
 
 async def nick_command(bot, uin: str, args: str) -> str:
+    """/nick <имя> — установить имя в чате"""
     nick = args.strip()
     if not nick:
         return f"Ваш текущий никнейм: {_manager.get_nick(uin)}\nИспользование: /nick <имя>"
@@ -384,10 +421,12 @@ async def nick_command(bot, uin: str, args: str) -> str:
 
 
 async def rooms_command(bot, uin: str, args: str) -> str:
+    """/rooms — список доступных комнат"""
     return f"Доступные комнаты:\n{_manager.list_rooms()}"
 
 
 async def join_command(bot, uin: str, args: str) -> str:
+    """/join <комната> [пароль] — зайти в комнату"""
     parts = args.split(maxsplit=1)
     if not parts:
         return "Использование: /join <комната> [пароль]"
@@ -404,14 +443,15 @@ async def join_command(bot, uin: str, args: str) -> str:
     members     = _manager.room_active_members(result)
     members_str = ", ".join(members) if members else "(только вы)"
     total       = len(_manager.room_subscribers(result))
-    lock_note   = "" if _manager.rooms[result].is_public else " (приватная)"
-    return (f"Присоединились к комнате: {result}{lock_note}\n"
-            f"Онлайн: {members_str}\n"
-            f"Всего в комнате: {total}\n"
-            f"Введите что угодно для чата, /leave для выхода.")
+    lock_note   = "" if _manager.rooms[result].is_public else " (приватная с паролем)"
+    return (f"✅ Присоединились к комнате: {result}{lock_note}\n"
+            f"👥 Онлайн: {members_str}\n"
+            f"📊 Всего в комнате: {total}\n"
+            f"💬 Введите что угодно для чата, /leave для выхода.")
 
 
 async def create_command(bot, uin: str, args: str) -> str:
+    """/create <комната> [пароль] — создать комнату"""
     parts = args.split(maxsplit=1)
     if not parts:
         return "Использование: /create <комната> [пароль]"
@@ -420,7 +460,7 @@ async def create_command(bot, uin: str, args: str) -> str:
     ok, result = _manager.create_room(uin, room_name, password)
     if not ok:
         return result
-    lock_note = f" с паролем '{password}'" if password else " (публичная)"
+    lock_note = f" с паролем" if password else " (публичная)"
     old_room  = _manager.current_room(uin)
     ok2, result2 = _manager.join_room(uin, room_name, password)
     if not ok2:
@@ -432,37 +472,44 @@ async def create_command(bot, uin: str, args: str) -> str:
     members     = _manager.room_active_members(room_name)
     members_str = ", ".join(members) if members else "(только вы)"
     total       = len(_manager.room_subscribers(room_name))
-    return (f"Комната '{room_name}' создана{lock_note}.\n"
-            f"Теперь вы в: {room_name}\n"
-            f"Онлайн: {members_str}\n"
-            f"Всего в комнате: {total}\n"
-            f"Введите что угодно для чата, /leave для выхода.")
+    return (f"🏠 Комната '{room_name}' создана{lock_note}.\n"
+            f"✅ Теперь вы в: {room_name}\n"
+            f"👥 Онлайн: {members_str}\n"
+            f"📊 Всего в комнате: {total}\n"
+            f"💬 Введите что угодно для чата, /leave для выхода.")
 
 
 async def who_command(bot, uin: str, args: str) -> str:
+    """/who — кто сейчас в комнате"""
     room = _manager.current_room(uin)
     if not room:
         return "Вы не в комнате. Используйте /join <комната> для входа."
     active     = _manager.room_active_members(room.name)
     total      = len(_manager.room_subscribers(room.name))
-    active_str = "\n  ".join(active) if active else "(никого нет в сети прямо сейчас)"
-    return (f"Комната: {room.name}\n"
-            f"Онлайн ({len(active)}):\n  {active_str}\n"
-            f"Всего в комнате: {total}")
+    active_str = "\n  • ".join(active) if active else "(никого нет в сети прямо сейчас)"
+    return (f"🏠 Комната: {room.name}\n"
+            f"🟢 Онлайн ({len(active)}):\n  • {active_str}\n"
+            f"📋 Всего в комнате: {total}")
 
 
 async def leave_command(bot, uin: str, args: str) -> str:
+    """/leave — выйти из комнаты"""
     room_name = _manager.leave_room(uin)
     if not room_name:
         return "Вы не в комнате."
     nick = _manager.get_nick(uin)
     await _broadcast(bot, room_name, f"* {nick} покинул комнату.")
-    return f"Покинули комнату: {room_name}"
+    return f"👋 Покинули комнату: {room_name}"
 
 
 # ── Обработчик по умолчанию ───────────────────────────────────────────────────
 
 async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
+    """
+    Обработчик сообщений в чате.
+    Если сообщение начинается с / — обрабатываем как публичную команду.
+    Иначе — рассылаем как обычный текст всем в комнате.
+    """
     if text.startswith("/"):
         parts   = text[1:].split(" ", 1)
         command = parts[0].lower()
@@ -471,7 +518,7 @@ async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
 
     room = _manager.current_room(uin)
     if not room:
-        return False
+        return False  # не в комнате — не обрабатываем
 
     should_remind = _manager.touch(uin)
     nick = _manager.get_nick(uin)
@@ -484,8 +531,8 @@ async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
         online_count = len(_manager.room_active_members(room.name))
         await bot._send_message(uin, (
             f"💬 Напоминание: вы находитесь в комнате «{room.name}».\n"
-            f"Сейчас онлайн: {online_count} чел.\n"
-            f"Напишите /leave чтобы выйти."
+            f"👥 Сейчас онлайн: {online_count} чел.\n"
+            f"🚪 Напишите /leave чтобы выйти."
         ))
 
-    return None
+    return None  # сообщение обработано, ответ не требуется

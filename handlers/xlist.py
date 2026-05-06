@@ -3,7 +3,14 @@ from icq_protocol import XSTATUS_GUIDS
 
 
 def setup(handler):
-    handler.register_command("xlist", xlist_command)
+    handler.register_command(
+        "xlist",
+        xlist_command,
+        help_text="/xlist — список доступных xstatus-ов",
+        group="Администратор"
+    )
+
+
 @admin_only()
 async def xlist_command(bot, user_id: str, args: str) -> str:
     xstatuses = list(XSTATUS_GUIDS.keys())
@@ -11,6 +18,6 @@ async def xlist_command(bot, user_id: str, args: str) -> str:
     chunk_size = 15
     result = "Available XStatuses:\n"
     for i in range(0, len(xstatuses), chunk_size):
-        result += ", ".join(xstatuses[i:i+chunk_size]) + "\n"
+        result += ", ".join(xstatuses[i:i + chunk_size]) + "\n"
     result += "\nUse /xstatus [name] to set, or /xstatus none to clear"
     return result

@@ -2,7 +2,13 @@ from command_handler import admin_only
 
 
 def setup(handler):
-    handler.register_command("xstatus", xstatus_command)
+    handler.register_command(
+        "xstatus",
+        xstatus_command,
+        help_text="/xstatus <имя|none> — установить/сбросить xstatus бота",
+        group="Администратор"
+    )
+
 
 @admin_only()
 async def xstatus_command(bot, user_id: str, args: str) -> str:
