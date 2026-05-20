@@ -576,6 +576,14 @@ class AsyncICQEchoBot:
         self.status_message = message
         await self.apply_status()
 
+    def set_xstatus_text(self, xstatus_name: str, title: str, desc: str = ""):
+        name = xstatus_name.lower()
+        if name not in XSTATUS_GUIDS:
+            raise ValueError(f"Unknown xstatus: {name}")
+        self.current_xstatus = name
+        self.xstatus_guid = bytes.fromhex(XSTATUS_GUIDS[name]) if XSTATUS_GUIDS[name] else b""
+        self.set_xtraz_text(title, desc)
+
     async def update_xstatus(self):
         await self._send_cli_setuserinfo()
         await asyncio.sleep(0.15)

@@ -21,9 +21,10 @@ async def main():
 
     bot = AsyncICQEchoBot(SERVER, PORT, UIN, PASSWORD)
 
-    bot.current_xstatus = "beer"
-    bot.set_xtraz_text("На пиве", "Адихаю")
-    bot.xstatus_guid = bytes.fromhex(XSTATUS_GUIDS[bot.current_xstatus])
+    #bot.current_xstatus = "beer"
+    #bot.set_xtraz_text("На пиве", "Адихаю")
+    #bot.xstatus_guid = bytes.fromhex(XSTATUS_GUIDS[bot.current_xstatus])
+    bot.set_xstatus_text("duck", "Уточка", "")
     
 
     command_handler = CommandHandler()
