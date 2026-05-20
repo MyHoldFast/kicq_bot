@@ -843,7 +843,7 @@ class AsyncICQEchoBot:
 
     async def _send_message(self, to_uin: str, text: str):
         try:
-            safe_text = sanitize_for_icq(text)
+            safe_text = sanitize_for_icq(text, max_bytes=10**9)
             safe_text = re.sub(r'\?{2,}', '', safe_text)
             safe_text = re.sub(r' {2,}', ' ', safe_text)
             safe_text = re.sub(r'\n{3,}', '\n\n', safe_text).strip()
