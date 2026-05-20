@@ -913,28 +913,39 @@ class AsyncICQEchoBot:
         except Exception as e:
             logging.error(f"Message handling error: {e}", exc_info=True)
 
+    async def send_typing(self, to_uin: str, is_typing: bool = True):
+        uin_b = to_uin.encode("ascii")
+        payload = (
+            b"\x00" * 8         
+            + b"\x00\x01"       
+            + struct.pack("!B", len(uin_b)) + uin_b
+            + struct.pack("!H", 0x0002 if is_typing else 0x0000)
+        )
+        await self._send_flap(2, make_snac(0x0004, 0x0014, reqid=0, payload=payload))
+
     async def _process_message(self, sender_uin: str, message_text: str):
         try:
             await asyncio.wait_for(self.semaphore.acquire(), timeout=0.1)
         except asyncio.TimeoutError:
-            logging.info(f"System busy, rejecting message from {sender_uin}")
             await self._send_message(sender_uin, "Sistema peregruzhena, poprobujte pozhe.")
             return
         try:
-            logging.info(f"Processing message from {sender_uin}: {message_text[:100]}")
+            await self.send_typing(sender_uin, True)
             if self.command_handler:
                 response = await self.command_handler.handle_message_async(
                     self, sender_uin, message_text)
                 if response:
                     await self._send_message(sender_uin, response)
-            else:
-                logging.warning("No command_handler set, ignoring message")
         except ConnectionError as e:
             logging.error(f"Connection lost while processing message from {sender_uin}: {e}")
         except Exception as e:
             logging.error(f"Error processing message from {sender_uin}: {e}", exc_info=True)
         finally:
             self.semaphore.release()
+            try:
+                await self.send_typing(sender_uin, False)
+            except Exception:
+                pass
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
