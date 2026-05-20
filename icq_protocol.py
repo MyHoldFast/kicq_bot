@@ -96,7 +96,7 @@ CLI_READY_DATA = bytes([
     0x00, 0x0b, 0x00, 0x01, 0x01, 0x10, 0x16, 0x4f,
 ])
 
-ICQ_MAX_MSG_BYTES = 1000
+ICQ_MAX_MSG_BYTES = 2000
 
 # ── Message sanitization ──────────────────────────────────────────────────────
 
@@ -823,6 +823,24 @@ class AsyncICQEchoBot:
 
     # ── Sending messages ──────────────────────────────────────────────────────
 
+    def _split_message(self, text: str) -> list[str]:
+        """Разбивает текст на части, не превышающие ICQ_MAX_MSG_BYTES байт в cp1251."""
+        parts = []
+        while text:
+            encoded = text.encode("cp1251", errors="ignore")
+            if len(encoded) <= ICQ_MAX_MSG_BYTES:
+                parts.append(text)
+                break
+            chunk = encoded[:ICQ_MAX_MSG_BYTES].decode("cp1251", errors="ignore")
+            cut = chunk.rfind("\n")
+            if cut <= 0:
+                cut = chunk.rfind(" ")
+            if cut <= 0:
+                cut = len(chunk)
+            parts.append(chunk[:cut].rstrip())
+            text = text[cut:].lstrip()
+        return [p for p in parts if p]
+
     async def _send_message(self, to_uin: str, text: str):
         try:
             safe_text = sanitize_for_icq(text)
@@ -833,17 +851,18 @@ class AsyncICQEchoBot:
                 logging.warning(f"Message to {to_uin} is empty after sanitization, skipping")
                 return
 
-            text_encoded = safe_text.encode("cp1251", errors="ignore")
-            if len(text_encoded) > ICQ_MAX_MSG_BYTES:
-                text_encoded = text_encoded[:ICQ_MAX_MSG_BYTES]
-
-            msg_tlv = struct.pack("!HHI", 0x0101, len(text_encoded) + 4, 0) + text_encoded
-            payload = (struct.pack("!Q", int(time.time()))
-                       + struct.pack("!H", 1)
-                       + struct.pack("!B", len(to_uin)) + to_uin.encode("ascii")
-                       + struct.pack("!HH", 0x0002, len(msg_tlv)) + msg_tlv)
-            await self._send_flap(2, make_snac(0x0004, 0x0006, payload=payload))
-            logging.info(f"Sent to {to_uin} ({len(text_encoded)}b): {safe_text[:100]}")
+            parts = self._split_message(safe_text)
+            for i, part in enumerate(parts):
+                text_encoded = part.encode("cp1251", errors="ignore")
+                msg_tlv = struct.pack("!HHI", 0x0101, len(text_encoded) + 4, 0) + text_encoded
+                payload = (struct.pack("!Q", int(time.time()))
+                        + struct.pack("!H", 1)
+                        + struct.pack("!B", len(to_uin)) + to_uin.encode("ascii")
+                        + struct.pack("!HH", 0x0002, len(msg_tlv)) + msg_tlv)
+                await self._send_flap(2, make_snac(0x0004, 0x0006, payload=payload))
+                logging.info(f"Sent to {to_uin} part {i+1}/{len(parts)} ({len(text_encoded)}b): {part[:100]}")
+                if i < len(parts) - 1:
+                    await asyncio.sleep(0.5)
 
         except ConnectionError as e:
             logging.error(f"Connection error while sending to {to_uin}: {e}")
