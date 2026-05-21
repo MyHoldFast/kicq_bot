@@ -374,11 +374,26 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
             except Exception:
                 pass
 
-    # Рассылаем анонс и включаем typing параллельно
-    await asyncio.gather(
-        _broadcast(bot, room.name, query_text, exclude_uin=uin),
-        broadcast_typing(True),
-    )
+    async def keep_typing():
+        """Периодически обновляет typing пока команда выполняется."""
+        try:
+            while True:
+                await asyncio.sleep(5)
+                await broadcast_typing(True)
+        except asyncio.CancelledError:
+            pass
+
+    # Включаем typing сразу
+    await broadcast_typing(True)
+
+    # Рассылаем анонс
+    await _broadcast(bot, room.name, query_text, exclude_uin=uin)
+
+    # Снова включаем typing после broadcast (он мог затянуться)
+    await broadcast_typing(True)
+
+    # Запускаем фоновое обновление typing каждые 5 секунд
+    typing_task = asyncio.create_task(keep_typing())
 
     handler_func = _command_handler.commands.get(command) if _command_handler else None
     if handler_func is None:
@@ -394,16 +409,17 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
             logging.error(f"Ошибка публичной команды /{command}: {e}", exc_info=True)
             answer = f"Ошибка выполнения /{command}: {e}"
 
-    # Гасим typing и рассылаем ответ параллельно
+    # Останавливаем фоновое обновление
+    typing_task.cancel()
+    await asyncio.gather(typing_task, return_exceptions=True)
+
+    # Гасим typing и рассылаем ответ
+    await broadcast_typing(False)
+
     if answer:
         response_msg = f"[{room.name}] Ответ для {nick}:\n{answer}"
         logging.info(f"Public command response in {room.name}: {response_msg[:100]}")
-        await asyncio.gather(
-            broadcast_typing(False),
-            _broadcast(bot, room.name, response_msg),
-        )
-    else:
-        await broadcast_typing(False)
+        await _broadcast(bot, room.name, response_msg)
 
     return None
 
