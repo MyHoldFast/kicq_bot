@@ -6,8 +6,8 @@ def setup(handler):
     handler.register_command(
         "xlist",
         xlist_command,
-        help_text="/xlist — список доступных xstatus-ов",
-        group="Администратор"
+      #  help_text="/xlist - список доступных xstatus-ов",
+       # group="Администратор"
     )
 
 

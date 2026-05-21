@@ -199,7 +199,7 @@ def setup(handler):
     handler.register_command(
         "weather",
         weather_command,
-        help_text="/weather [город] — погода (город запоминается)",
+        help_text="/weather [город] - погода (город запоминается)",
         group="Погода"
     )
 

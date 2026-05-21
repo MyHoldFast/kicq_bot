@@ -2,7 +2,7 @@ def setup(handler):
     handler.register_command(
         "clear",
         clear_command,
-        help_text="/clear — забыть историю разговора с Qwen",
+        help_text="/clear - забыть историю разговора с Qwen",
         group="Основные"
     )
     handler.register_command("reset", clear_command)  # алиас без дублирования в справке

@@ -2,7 +2,7 @@ def setup(handler):
     handler.register_command(
         "help",
         help_command,
-        help_text="/help — список всех команд",
+        help_text="/help - список всех команд",
         group="Основные"
     )
     handler.register_command("start", help_command)  # без help_text — не дублируем в справке

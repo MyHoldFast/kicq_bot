@@ -5,8 +5,8 @@ def setup(handler):
     handler.register_command(
         "xstatus",
         xstatus_command,
-        help_text="/xstatus <имя|none> — установить/сбросить xstatus бота",
-        group="Администратор"
+      #  help_text="/xstatus <имя|none> - установить/сбросить xstatus бота",
+      #  group="Администратор"
     )
 
 

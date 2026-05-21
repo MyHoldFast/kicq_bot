@@ -5,8 +5,8 @@ def setup(handler):
     handler.register_command(
         "status",
         status_command,
-        help_text="/status [online|away|dnd|free] [текст] — статус бота",
-        group="Администратор"
+      #  help_text="/status [online|away|dnd|free] [текст] - статус бота",
+      #  group="Администратор"
     )
 
 

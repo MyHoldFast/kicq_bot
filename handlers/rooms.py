@@ -269,25 +269,25 @@ def setup(handler):
     _command_handler = handler
 
     handler.register_command("nick",   nick_command,
-                             help_text="/nick <имя> — установить имя в чате",
+                             help_text="/nick <имя> - установить имя в чате",
                              group="Чат-комнаты")
     handler.register_command("rooms",  rooms_command,
-                             help_text="/rooms — список доступных комнат",
+                             help_text="/rooms - список доступных комнат",
                              group="Чат-комнаты")
     handler.register_command("join",   join_command,
-                             help_text="/join <комната> [пароль] — зайти в комнату",
+                             help_text="/join <комната> [пароль] - зайти в комнату",
                              group="Чат-комнаты")
     handler.register_command("create", create_command,
-                             help_text="/create <комната> [пароль] — создать комнату",
+                             help_text="/create <комната> [пароль] - создать комнату",
                              group="Чат-комнаты")
     handler.register_command("who",    who_command,
-                             help_text="/who — кто сейчас в комнате",
+                             help_text="/who - кто сейчас в комнате",
                              group="Чат-комнаты")
     handler.register_command("leave",  leave_command,
-                             help_text="/leave — выйти из комнаты",
+                             help_text="/leave - выйти из комнаты",
                              group="Чат-комнаты")
     handler.register_command("qwen",   qwen_room_command,
-                             help_text="/qwen <вопрос> — спросить у Qwen (видно всем в комнате)",
+                             help_text="/qwen <вопрос> - спросить у Qwen (видно всем в комнате)",
                              group="Чат-комнаты")
 
     handler.room_public_commands.add("weather")
