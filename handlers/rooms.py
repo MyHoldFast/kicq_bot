@@ -364,15 +364,21 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
 
     query_text = f"[{room.name}] {nick}: /{command}" + (f" {args}" if args else "")
     logging.info(f"Public command in {room.name}: {query_text}")
-    await _broadcast(bot, room.name, query_text, exclude_uin=uin)
 
-    # Все в комнате видят что бот "думает"
-    targets = [u for u in _manager.room_subscribers(room.name)]
-    for target in targets:
-        try:
-            await bot.send_typing(target, True)
-        except Exception:
-            pass
+    targets = list(_manager.room_subscribers(room.name))
+
+    async def broadcast_typing(is_typing: bool):
+        for target in targets:
+            try:
+                await bot.send_typing(target, is_typing)
+            except Exception:
+                pass
+
+    # Рассылаем анонс и включаем typing параллельно
+    await asyncio.gather(
+        _broadcast(bot, room.name, query_text, exclude_uin=uin),
+        broadcast_typing(True),
+    )
 
     handler_func = _command_handler.commands.get(command) if _command_handler else None
     if handler_func is None:
@@ -388,17 +394,16 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
             logging.error(f"Ошибка публичной команды /{command}: {e}", exc_info=True)
             answer = f"Ошибка выполнения /{command}: {e}"
 
-    # Гасим typing перед отправкой ответа
-    for target in targets:
-        try:
-            await bot.send_typing(target, False)
-        except Exception:
-            pass
-
+    # Гасим typing и рассылаем ответ параллельно
     if answer:
         response_msg = f"[{room.name}] Ответ для {nick}:\n{answer}"
         logging.info(f"Public command response in {room.name}: {response_msg[:100]}")
-        await _broadcast(bot, room.name, response_msg)
+        await asyncio.gather(
+            broadcast_typing(False),
+            _broadcast(bot, room.name, response_msg),
+        )
+    else:
+        await broadcast_typing(False)
 
     return None
 
