@@ -362,6 +362,7 @@ class AsyncICQEchoBot:
         self.xstatus_message_xtraz = ""
 
         self.command_handler = None
+        self.typing_handler = None
         self.semaphore       = asyncio.Semaphore(max_concurrent)
         self.active_tasks: set[asyncio.Task] = set()
 
@@ -641,6 +642,21 @@ class AsyncICQEchoBot:
                     logging.info(f"[CLIENT] {uin}: {client}")
             except Exception as e:
                 logging.error(f"USER_ONLINE parse error: {e}")
+        if fam == 0x0004 and sub == 0x0014:
+            try:
+                pos = 10
+                pos += 8  # cookie
+                pos += 2  # channel
+                uin_len = data[pos]; pos += 1
+                uin = data[pos:pos + uin_len].decode("ascii", errors="ignore")
+                pos += uin_len
+                flag = struct.unpack_from("!H", data, pos)[0]
+                is_typing = (flag == 0x0002)
+                logging.debug(f"Typing from {uin}: {is_typing}")
+                if self.typing_handler:
+                    asyncio.create_task(self.typing_handler(self, uin, is_typing))
+            except Exception as e:
+                logging.error(f"Typing SNAC parse error: {e}")
 
     # ── xTraz methods ─────────────────────────────────────────────────────────
 

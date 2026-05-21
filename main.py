@@ -29,6 +29,7 @@ async def main():
 
     command_handler = CommandHandler()
     bot.command_handler = command_handler
+    command_handler.bot = bot
 
     command_handler.register_qwen(QWEN_API_KEY)
     logging.info("Qwen AI handler registered")

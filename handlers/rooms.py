@@ -295,6 +295,7 @@ def setup(handler):
     logging.info(f"ChatRooms: room_public_commands = {handler.room_public_commands}")
 
     handler.set_default_handler(chat_message_handler)
+    handler.bot.typing_handler = _on_typing
 
     asyncio.get_event_loop().create_task(_idle_checker())
 
@@ -338,6 +339,18 @@ async def _broadcast_to_active(bot, room_name: str, text: str, exclude_uin: str 
     tasks = [bot._send_message(u, text) for u in targets]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+async def _on_typing(bot, uin: str, is_typing: bool):
+    """Проксирует typing-уведомление от участника комнаты остальным её членам."""
+    room = _manager.current_room(uin)
+    if not room:
+        return
+    targets = [u for u in _manager.room_subscribers(room.name) if u != uin]
+    for target in targets:
+        try:
+            await bot.send_typing(target, is_typing)
+        except Exception as e:
+            logging.warning(f"_on_typing proxy failed for {target}: {e}")
 
 
 async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
@@ -501,11 +514,6 @@ async def leave_command(bot, uin: str, args: str) -> str:
 # ── Обработчик по умолчанию ───────────────────────────────────────────────────
 
 async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
-    """
-    Обработчик сообщений в чате.
-    Если сообщение начинается с / — обрабатываем как публичную команду.
-    Иначе — рассылаем как обычный текст всем в комнате.
-    """
     if text.startswith("/"):
         parts   = text[1:].split(" ", 1)
         command = parts[0].lower()
@@ -514,10 +522,18 @@ async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
 
     room = _manager.current_room(uin)
     if not room:
-        return False  # не в комнате — не обрабатываем
+        return False
 
     should_remind = _manager.touch(uin)
     nick = _manager.get_nick(uin)
+
+    # Сбрасываем typing у всех перед отправкой сообщения
+    targets = [u for u in _manager.room_subscribers(room.name) if u != uin]
+    for target in targets:
+        try:
+            await bot.send_typing(target, False)
+        except Exception:
+            pass
 
     await _broadcast(bot, room.name, f"[{room.name}] {nick}: {text}", exclude_uin=uin)
 
@@ -529,4 +545,4 @@ async def chat_message_handler(bot, uin: str, text: str) -> Optional[str]:
             f"Напишите /leave чтобы выйти."
         ))
 
-    return None  # сообщение обработано, ответ не требуется
+    return None
