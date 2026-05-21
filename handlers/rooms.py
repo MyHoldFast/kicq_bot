@@ -354,13 +354,6 @@ async def _on_typing(bot, uin: str, is_typing: bool):
 
 
 async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
-    """
-    Выполняет публичную команду в комнате:
-    1. Анонсирует запрос всем подписчикам (кроме отправителя)
-    2. Выполняет команду
-    3. Рассылает ответ всем подписчикам
-    Возвращает False если пользователь не в комнате.
-    """
     room = _manager.current_room(uin)
     if not room:
         logging.debug(f"_run_public_command_in_room: {uin} не в комнате")
@@ -372,6 +365,14 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
     query_text = f"[{room.name}] {nick}: /{command}" + (f" {args}" if args else "")
     logging.info(f"Public command in {room.name}: {query_text}")
     await _broadcast(bot, room.name, query_text, exclude_uin=uin)
+
+    # Все в комнате видят что бот "думает"
+    targets = [u for u in _manager.room_subscribers(room.name)]
+    for target in targets:
+        try:
+            await bot.send_typing(target, True)
+        except Exception:
+            pass
 
     handler_func = _command_handler.commands.get(command) if _command_handler else None
     if handler_func is None:
@@ -387,12 +388,19 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
             logging.error(f"Ошибка публичной команды /{command}: {e}", exc_info=True)
             answer = f"Ошибка выполнения /{command}: {e}"
 
+    # Гасим typing перед отправкой ответа
+    for target in targets:
+        try:
+            await bot.send_typing(target, False)
+        except Exception:
+            pass
+
     if answer:
         response_msg = f"[{room.name}] Ответ для {nick}:\n{answer}"
         logging.info(f"Public command response in {room.name}: {response_msg[:100]}")
         await _broadcast(bot, room.name, response_msg)
 
-    return None  # ответ уже разослан
+    return None
 
 
 # ── Обработчики команд ────────────────────────────────────────────────────────
