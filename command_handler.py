@@ -1,11 +1,10 @@
 import os
+import sys
 import json
 import importlib.util
 import asyncio
 import logging
 from typing import Dict, Callable, Optional, Set
-
-###TODO сообщения на / в личке - нет команды, а в чате так слать
 
 _DB_DIR       = "db"
 _SEEN_DB_PATH = os.path.join(_DB_DIR, "seen_users.json")
@@ -37,10 +36,10 @@ class CommandHandler:
         self.commands: Dict[str, Callable] = {}
         self.default_handler: Optional[Callable] = None
         self.qwen = None
+        self.bot = None
         self.active_requests: Dict[str, asyncio.Task] = {}
         self.room_public_commands: Set[str] = set()
 
-        # Реестр справки: команда -> (краткое описание, группа)
         self._help_entries: Dict[str, tuple] = {}
         self._help_groups: Dict[str, list] = {}
 
@@ -49,11 +48,6 @@ class CommandHandler:
 
     def register_command(self, command: str, handler: Callable,
                          help_text: str = None, group: str = "Прочее"):
-        """
-        Регистрирует команду.
-        help_text — строка вида "/<команда> [аргументы] — описание"
-        group     — название группы в /help
-        """
         self.commands[command] = handler
         if help_text:
             self._help_entries[command] = (help_text, group)
@@ -62,8 +56,6 @@ class CommandHandler:
                 self._help_groups[group].append(command)
 
     def build_help_text(self) -> str:
-        """Собирает общий /help из зарегистрированных описаний."""
-        # Определённый порядок групп
         group_order = [
             "Основные",
             "Чат-комнаты",
@@ -71,14 +63,12 @@ class CommandHandler:
             "Игры",
             "Утилиты",
             "Прочее",
-          #  "Администратор",
         ]
 
         lines = ["Доступные команды:\n"]
 
         seen_groups = set()
 
-        # Сначала группы в заданном порядке
         for group in group_order:
             if group in self._help_groups:
                 seen_groups.add(group)
@@ -88,7 +78,6 @@ class CommandHandler:
                     lines.append(f"  {text}")
                 lines.append("")
 
-        # Потом всё остальное
         for group, cmds in self._help_groups.items():
             if group not in seen_groups:
                 lines.append(f"{group}:")
@@ -109,6 +98,14 @@ class CommandHandler:
         from qwen_handler import QwenHandler
         self.qwen = QwenHandler(api_key=api_key)
 
+    def get_qwen(self):
+        """Публичный метод для доступа к Qwen из других модулей."""
+        return self.qwen
+
+    async def call_qwen(self, user_id: str, message: str) -> Optional[str]:
+        """Публичный метод для вызова Qwen из других модулей."""
+        return await self._call_qwen(user_id, message)
+
     def load_commands_from_directory(self, directory: str):
         if not os.path.exists(directory):
             logging.warning(f"Commands directory {directory} not found")
@@ -120,6 +117,7 @@ class CommandHandler:
                 try:
                     spec   = importlib.util.spec_from_file_location(module_name, module_path)
                     module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module  # регистрируем ДО exec, чтобы import нашёл тот же объект
                     spec.loader.exec_module(module)
                     if hasattr(module, 'setup'):
                         module.setup(self)

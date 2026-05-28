@@ -185,7 +185,7 @@ def format_response(text: str) -> str:
     text = fix_punctuation(text)
     text = emoji_to_simple(text)          # сначала заменяем известные эмодзи
     text = remove_unhandled_emoji(text)   # потом удаляем все оставшиеся
-    text = clean_for_win1251(text)        # финальная очистка для cp1251
+#    text = clean_for_win1251(text)        # финальная очистка для cp1251
     return text
 
 
