@@ -18,7 +18,7 @@ import struct
 import time, re
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 log = logging.getLogger("icq_core")
 
@@ -31,7 +31,7 @@ class AuthError(ConnectionError):
 SERVER = "195.66.114.37"
 PORT   = 5190
 
-ICQ_MAX_CHARS = 1000  # UTF-16BE: 1000 символов = 2000 байт
+ICQ_MAX_CHARS = 2000
 
 
 CAP_QIP2005         = bytes.fromhex("563FC8090B6F41514950203230303561")
@@ -46,7 +46,7 @@ CAP_MIRANDA = bytes.fromhex("4D6972616E64614D61696E0000000000")
 CAP_ICQ6    = bytes.fromhex("3B7248ED5EDE4D6993F729D5BDF8A27F")
 CAP_ICQ7    = bytes.fromhex("3FF19BEB53714657BCDEA39142E55D99")
 
-KNOWN_CAPS: dict[bytes, str] = {
+KNOWN_CAPS: Dict[bytes, str] = {
     CAP_QIP2005: "QIP 2005a",
     CAP_JIMM:    "Jimm",
     CAP_MIRANDA: "Miranda",
@@ -67,7 +67,7 @@ CLI_READY_DATA = bytes([
     0x00,0x0b,0x00,0x01,0x01,0x10,0x16,0x4f,
 ])
 
-XSTATUS_TABLE: list[tuple[str, str]] = [
+XSTATUS_TABLE: List[Tuple[str, str]] = [
     ("63627337A03F49FF80E5F709CDE0A4EE", "shopping"),
     ("5A581EA1E580430CA06F612298B7E4C7", "duck"),
     ("83C9B78E77E74378B2C5FB6CFCC35BEC", "tired"),
@@ -106,11 +106,11 @@ XSTATUS_TABLE: list[tuple[str, str]] = [
     ("0072D9084AD143DD91996F026966026F", "diary"),
 ]
 
-XSTATUS_BY_NAME: dict[str, str] = {
+XSTATUS_BY_NAME: Dict[str, str] = {
     name: guid_hex.upper() for guid_hex, name in XSTATUS_TABLE
 }
 
-_XSTATUS_BY_GUID: dict[str, str] = {
+_XSTATUS_BY_GUID: Dict[str, str] = {
     g.upper(): n for g, n in XSTATUS_TABLE
 }
 
@@ -247,7 +247,7 @@ def _make_tlv(t: int, v: bytes) -> bytes:
     return struct.pack("!HH", t, len(v)) + v
 
 
-def _parse_tlvs(data: bytes) -> dict[int, bytes]:
+def _parse_tlvs(data: bytes) -> Dict[int, bytes]:
     out, p = {}, 0
     while p + 4 <= len(data):
         t, l = struct.unpack_from("!HH", data, p)
@@ -308,7 +308,7 @@ def _guid_to_name(guid_bytes: bytes) -> str:
     return _XSTATUS_BY_GUID.get(guid_bytes.hex().upper(), "")
 
 
-def _split_text(text: str) -> list[str]:
+def _split_text(text: str) -> List[str]:
     parts = []
     while text:
         if len(text) <= ICQ_MAX_CHARS:
@@ -377,7 +377,7 @@ SSI_AUTH_REPLY      = 0x001B   # s→c: ответ на наш запрос (gra
 SSI_YOU_WERE_ADDED  = 0x001C   # s→c: тебя добавили в список
 
 
-def _read_asciiz_le(data: bytes, pos: int) -> tuple[str, int]:
+def _read_asciiz_le(data: bytes, pos: int) -> Tuple[str, int]:
     """
     Читает строку в формате ICQ-метасервера: LE(2) длина + байты + null.
     Возвращает (строка, новая_позиция).
@@ -397,6 +397,23 @@ def _read_asciiz_le(data: bytes, pos: int) -> tuple[str, int]:
         except UnicodeDecodeError:
             continue
     return text.decode("latin-1", errors="replace"), pos
+
+
+def _make_email_tlv_le(email: str, is_hidden: bool = False) -> bytes:
+    try:
+        encoded = email.encode("ascii")
+    except UnicodeEncodeError:
+        encoded = email.encode("utf-8")
+    str_len = len(encoded) + 1          # +1 за \x00
+    flag = 0x01 if is_hidden else 0x00
+    value = struct.pack("<H", str_len) + encoded + b"\x00" + struct.pack("B", flag)
+    return struct.pack("<HH", SAVE_TLV_EMAIL, len(value)) + value
+
+
+def _make_empty_email_tlv_le() -> bytes:
+    """Пустой email-слот: str_len=1, email="", \x00, flag=0x01"""
+    value = struct.pack("<H", 1) + b"\x00" + struct.pack("B", 0x01)
+    return struct.pack("<HH", SAVE_TLV_EMAIL, len(value)) + value
 
 
 def _make_asciiz_tlv_le(tlv_id: int, text: str) -> bytes:
@@ -442,7 +459,7 @@ def _make_meta_snac(my_uin: str, subtype: int,
     return _make_tlv(0x0001, tlv_body)
 
 
-def _read_search_string(data: bytes, pos: int) -> tuple[str, int]:
+def _read_search_string(data: bytes, pos: int) -> Tuple[str, int]:
     """
     Читает строку из результата поиска по SearchAction.java:
       LE(len:2) + bytes (без null-терминатора — в отличие от asciiz!).
@@ -483,7 +500,7 @@ def _parse_search_result(data: bytes) -> Optional["SearchResult"]:
             return None
         uin = struct.unpack_from("<I", data, pos)[0]; pos += 4
 
-        strings: list[str] = []
+        strings: List[str] = []
         for _ in range(4):
             s, pos = _read_search_string(data, pos)
             strings.append(s)
@@ -536,9 +553,9 @@ def _decode_ssi_nick(raw: bytes) -> str:
     return ""
 
 
-def _parse_ssi(data: bytes) -> tuple[list[Group], list[Contact]]:
-    groups:   list[Group]   = []
-    contacts: list[Contact] = []
+def _parse_ssi(data: bytes) -> Tuple[List[Group], List[Contact]]:
+    groups:   List[Group]   = []
+    contacts: List[Contact] = []
 
     if len(data) < 3:
         return groups, contacts
@@ -575,7 +592,7 @@ def _parse_ssi(data: bytes) -> tuple[list[Group], list[Contact]]:
 
 
 
-def _parse_tlv001d(data: bytes) -> tuple[str, str]:
+def _parse_tlv001d(data: bytes) -> Tuple[str, str]:
     xstatus_name = ""
     xstatus_msg  = ""
     ps  = 0
@@ -739,7 +756,7 @@ def _parse_xtraz_request(text: str) -> Optional[str]:
         return None
 
 
-def _parse_xtraz_response(text: str) -> Optional[tuple[str, str]]:
+def _parse_xtraz_response(text: str) -> Optional[Tuple[str, str]]:
     """
     Парсит xTraz-ответ из строки (уже декодированный текст).
     Возвращает (title, desc) или None.
@@ -809,7 +826,7 @@ def _parse_xtraz_request_bytes(data: bytes) -> Optional[str]:
         return None
 
 
-def _parse_xtraz_response_bytes(data: bytes) -> Optional[tuple[str, str]]:
+def _parse_xtraz_response_bytes(data: bytes) -> Optional[Tuple[str, str]]:
     """
     Парсит входящий xTraz-ответ (bytes, duck-вариант).
     Возвращает (title, desc) или None.
@@ -976,7 +993,7 @@ class ICQClient:
     Колбэки (устанавливаются снаружи):
         on_connected()
         on_disconnected()
-        on_roster(groups: list[Group], contacts: list[Contact])
+        on_roster(groups: List[Group], contacts: List[Contact])
         on_contact_online(contact: Contact)
         on_contact_offline(contact: Contact)
         on_contact_status(contact: Contact)
@@ -987,7 +1004,7 @@ class ICQClient:
         on_my_info(info: UserInfo)          ← своя анкета получена/обновлена
         on_user_info(info: UserInfo)        ← анкета другого пользователя
         on_search_result(result: SearchResult)  ← одна запись в процессе поиска
-        on_search_done(results: list[SearchResult])  ← поиск завершён
+        on_search_done(results: List[SearchResult])  ← поиск завершён
         on_offline_message(message: Message)    ← оффлайн-сообщение из очереди
         on_auth_request(uin: str, message: str) ← кто-то просит авторизацию
         on_auth_reply(uin: str, granted: bool, message: str)  ← ответ на наш запрос
@@ -997,7 +1014,7 @@ class ICQClient:
         await client.request_my_info()               → заполняет my_info / my_nick
         await client.request_user_info(uin)
         await client.save_my_info(info: UserInfo) → bool
-        await client.search_users(uin/nick/email/…) → list[SearchResult]
+        await client.search_users(uin/nick/email/…) → List[SearchResult]
         await client.add_contact(uin, nick, group_id) → bool
         await client.remove_contact(uin)              → bool
         await client.send_message(to_uin, text)
@@ -1009,8 +1026,8 @@ class ICQClient:
     Атрибуты:
         client.my_nick  — никнейм, сохраняется после request_my_info() / save_my_info()
         client.my_info  — UserInfo собственной анкеты
-        client.contacts — dict[uin, Contact]
-        client.groups   — dict[group_id, Group]
+        client.contacts — Dict[uin, Contact]
+        client.groups   — Dict[group_id, Group]
     """
 
     def __init__(self, uin: str, password: str,
@@ -1028,8 +1045,8 @@ class ICQClient:
         self._stop_requested    = False
         self._intentional_stop  = False
 
-        self.groups:   dict[int, Group]   = {}
-        self.contacts: dict[str, Contact] = {}
+        self.groups:   Dict[int, Group]   = {}
+        self.contacts: Dict[str, Contact] = {}
 
         self._my_status:        Status = Status.FREE
         self._my_status_msg:    str    = ""
@@ -1041,15 +1058,15 @@ class ICQClient:
         self.my_nick: str      = ""
         self.my_info: Optional[UserInfo] = None
 
-        self._pending_info:   dict[int, tuple[str, UserInfo, set[int]]] = {}
-        self._pending_save:   dict[int, asyncio.Future] = {}
-        self._pending_search: dict[int, list[SearchResult]] = {}
-        self._search_futures: dict[int, asyncio.Future] = {}
+        self._pending_info:   Dict[int, Tuple[str, UserInfo, Set[int]]] = {}
+        self._pending_save:   Dict[int, asyncio.Future] = {}
+        self._pending_search: Dict[int, List[SearchResult]] = {}
+        self._search_futures: Dict[int, asyncio.Future] = {}
         self._meta_seq: int = 0
 
-        self._pending_ssi_ack: dict[int, asyncio.Future] = {}
-        self._client_cache: dict[str, str] = {}
-        self._message_tasks: set[asyncio.Task] = set()
+        self._pending_ssi_ack: Dict[int, asyncio.Future] = {}
+        self._client_cache: Dict[str, str] = {}
+        self._message_tasks: Set[asyncio.Task] = set()
 
         self.on_connected:       Optional[Callable] = None
         self.on_disconnected:    Optional[Callable] = None
@@ -1119,7 +1136,7 @@ class ICQClient:
     def get_contact(self, uin: str) -> Optional[Contact]:
         return self.contacts.get(uin)
 
-    def get_online_contacts(self) -> list[Contact]:
+    def get_online_contacts(self) -> List[Contact]:
         return [c for c in self.contacts.values() if c.is_online]
 
 
@@ -1142,45 +1159,27 @@ class ICQClient:
 
 
     async def send_auth_request(self, to_uin: str, message: str = ""):
-        """
-        Отправляет запрос авторизации пользователю to_uin (SNAC 0x13/0x18).
-
-        Нужно вызывать после add_contact(), если контакт вернул auth_req=True
-        (т.е. сервер ответил SSI_UPDATE_AUTH_REQUIRED=0x000E).
-        Ответ придёт через колбэк on_auth_reply(uin, granted, message).
-
-        Формат пакета (по process_ssi_auth_req в sn13_icq_contacts.cpp):
-          BYTE(uin_len) + uin_ascii
-          BE(msg_len:2) + message_bytes
-          BE(0x0000:2)  — флаг charset (без доп. charset)
-        """
         uin_b = to_uin.encode("ascii")
         msg_b = message.encode("utf-8")
         payload = (struct.pack("!B", len(uin_b)) + uin_b
-                   + struct.pack("!H", len(msg_b)) + msg_b
-                   + struct.pack("!H", 0x0000))
+                + struct.pack("!H", len(msg_b)) + msg_b)
+                # НЕТ 0x0000 в конце
         await self._send_snac(0x0013, SSI_AUTH_SEND_REQ, payload)
         log.info(f"send_auth_request → {to_uin}")
+        
 
     async def send_auth_reply(self, to_uin: str, granted: bool, message: str = ""):
         """
-        Отвечает на входящий запрос авторизации (SNAC 0x13/0x1A).
-
-        Вызывается в ответ на колбэк on_auth_request(uin, message).
-
-        Формат пакета (по process_ssi_auth_rep в sn13_icq_contacts.cpp):
-          BYTE(uin_len) + uin_ascii
-          BYTE(auth_state)  — 0x01=granted, 0x00=denied
-          BE(msg_len:2) + message_bytes
-          BE(0x0000:2)  — флаг charset
+        SNAC 13/1A: BYTE uin_len + uin + BYTE flag + WORD msg_len + STRING msg
+        Без финального 0x0000 — его нет в спецификации!
         """
         uin_b = to_uin.encode("ascii")
         msg_b = message.encode("utf-8")
         auth_byte = 0x01 if granted else 0x00
         payload = (struct.pack("!B", len(uin_b)) + uin_b
-                   + struct.pack("!B", auth_byte)
-                   + struct.pack("!H", len(msg_b)) + msg_b
-                   + struct.pack("!H", 0x0000))
+                + struct.pack("!B", auth_byte)
+                + struct.pack("!H", len(msg_b)) + msg_b)
+                # НЕТ 0x0000 в конце!
         await self._send_snac(0x0013, SSI_AUTH_SEND_REPLY, payload)
         log.info(f"send_auth_reply → {to_uin}: {'granted' if granted else 'denied'}")
 
@@ -1250,12 +1249,9 @@ class ICQClient:
             self._pending_save.pop(seq, None)
             log.warning("save_my_info: timeout")
             return False
+        
 
     def _build_save_info_body(self, info: UserInfo) -> bytes:
-        """
-        Строит тело запроса CLI_SET_FULLINFO по SaveInfoAction.java.
-        Все TLV в LE-формате.
-        """
         buf = bytearray()
         buf += _make_asciiz_tlv_le(SAVE_TLV_NICK,      info.nick)
         buf += _make_asciiz_tlv_le(SAVE_TLV_FIRSTNAME, info.first_name)
@@ -1265,7 +1261,13 @@ class ICQClient:
         buf += _make_asciiz_tlv_le(SAVE_TLV_CITY,      info.city)
 
         if info.email:
-            buf += _make_asciiz_tlv_le(SAVE_TLV_EMAIL, info.email)
+            buf += _make_email_tlv_le(info.email, is_hidden=False)
+            empty_count = 9
+        else:
+            empty_count = 10
+
+        for _ in range(empty_count):
+            buf += _make_empty_email_tlv_le()
 
         if info.birthday:
             parts = info.birthday.split(".")
@@ -1294,7 +1296,7 @@ class ICQClient:
         keyword:     str  = "",
         only_online: bool = False,
         timeout:     float = 30.0,
-    ) -> list[SearchResult]:
+    ) -> List[SearchResult]:
         """
         Поиск пользователей (SNAC 0x15/0x02, тип 0x055F).
         Строго по SearchAction.java.
@@ -1486,7 +1488,7 @@ class ICQClient:
         await self._send_snac(0x0013, CLI_ADDEND_CMD)
         return ok
 
-    async def create_group(self, name: str) -> tuple[bool, Optional["Group"]]:
+    async def create_group(self, name: str) -> Tuple[bool, Optional["Group"]]:
         """
         Создаёт новую группу в SSI.
 
@@ -2250,7 +2252,7 @@ class ICQClient:
         self._writer.write(_pack_flap(channel, self._seq, payload))
         await self._writer.drain()
 
-    async def _recv_flap(self, timeout: float = None) -> tuple[int, int, bytes]:
+    async def _recv_flap(self, timeout: float = None) -> Tuple[int, int, bytes]:
         try:
             coro = self._reader.readexactly(6)
             hdr  = await (asyncio.wait_for(coro, timeout) if timeout else coro)
@@ -2311,11 +2313,11 @@ class ICQClient:
         await asyncio.sleep(0.2)
         self._reader, self._writer = await asyncio.open_connection(host, port)
         try:
-            await self._recv_flap(timeout=4.0)
+            await self._recv_flap(timeout=10.0)
         except Exception:
             pass
         await self._send_flap(1, b"\x00\x00\x00\x01" + _make_tlv(6, self._cookie))
-        await self._recv_flap(timeout=5.0)
+        await self._recv_flap(timeout=20.0)
         log.info("BOS auth OK")
 
     async def _initialize(self):
@@ -2524,30 +2526,53 @@ class ICQClient:
 
 
     async def _handle_ssi_auth_request(self, data: bytes):
-        """
-        Сервер прислал SNAC 0x13/0x19 — кто-то хочет добавить нас в список.
-
-        Структура (после SNAC-заголовка 10 байт):
-          BYTE(uin_len) + uin_ascii
-          BE(msg_len:2) + message_bytes
-          BE(charset_flag:2)  [+ charset если flag != 0]
-
-        Вызывает on_auth_request(uin: str, message: str).
-        Чтобы ответить — вызови send_auth_reply(uin, granted, message).
-        """
         try:
+            log.debug(f"SSI auth raw ({len(data)} bytes): {data.hex(' ')}")
             pos = 10
-            if pos >= len(data):
+
+
+            uin = None
+            for i in range(pos, len(data)):
+                if 48 <= data[i] <= 57:
+                    start = i
+                    while i < len(data) and 48 <= data[i] <= 57:
+                        i += 1
+                    uin = data[start:i].decode('ascii')
+                    pos = i
+                    break
+            if uin is None:
                 return
-            uin_len = data[pos]; pos += 1
-            uin = data[pos:pos + uin_len].decode("ascii", errors="ignore"); pos += uin_len
-            if pos + 2 > len(data):
-                return
-            msg_len = struct.unpack_from("!H", data, pos)[0]; pos += 2
-            raw_msg = data[pos:pos + msg_len]; pos += msg_len
-            message = raw_msg.decode("utf-8", errors="replace").rstrip("\x00")
+
+
+            if pos < len(data) and data[pos] == 0x00:
+                pos += 1
+
+
+            if pos + 1 < len(data) and data[pos+1] >= 0xC0:
+                pos += 1
+
+
+            msg_start = pos
+            msg_end = msg_start
+            while msg_end + 4 <= len(data):
+                if data[msg_end:msg_end+4] == b'\x00\x01\x00\x01':
+                    break
+                msg_end += 1
+            raw_msg = data[msg_start:msg_end]
+
+
+            charset = "utf-8"
+            for i in range(msg_end, len(data)-4):
+                if data[i] == 0x00 and data[i+1] == 0x05:
+                    tlv_len = struct.unpack_from("!H", data, i+2)[0]
+                    if i+4+tlv_len <= len(data):
+                        charset = data[i+4:i+4+tlv_len].decode('ascii', errors='ignore')
+                    break
+
+            message = raw_msg.decode(charset, errors='replace')
             log.info(f"Auth request from {uin}: {message!r}")
             await self._fire(self.on_auth_request, uin, message)
+
         except Exception as e:
             log.error(f"_handle_ssi_auth_request error: {e}", exc_info=True)
 
