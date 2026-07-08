@@ -168,9 +168,10 @@ class Contact:
     client:      str    = "Unknown"
     xstatus:     str    = ""
     xstatus_msg: str    = ""
-    signon_time: int    = 0
-    online_secs: int    = 0
-    idle_secs:   int    = 0
+    signon_time:  int  = 0
+    online_secs:  int  = 0
+    idle_secs:    int  = 0
+    pending_auth: bool = False   # True = сервер требует авторизацию для этого UIN
 
     @property
     def display_name(self) -> str:
@@ -216,6 +217,7 @@ class UserInfo:
     work_name:  str  = ""   # название компании
     work_dep:   str  = ""   # отдел
     work_pos:   str  = ""   # должность
+    auth_required: bool = False  # True = требовать авторизацию при добавлении
 
     @property
     def full_name(self) -> str:
@@ -357,6 +359,7 @@ SAVE_TLV_CITY      = 0x0190
 SAVE_TLV_HOME_PAGE = 0x0213
 SAVE_TLV_ABOUT     = 0x0258
 SAVE_TLV_GENDER    = 0x017C
+# SAVE_TLV_AUTH_REQUIRED не используется: auth управляется через META_INFO_SET_PERMS (0x0424)
 
 CLI_ROSTERADD_CMD    = 0x0008   # добавить запись SSI
 CLI_ROSTERDELETE_CMD = 0x000A   # удалить запись SSI
@@ -585,8 +588,10 @@ def _parse_ssi(data: bytes) -> Tuple[List[Group], List[Contact]]:
 
         elif item_type == 0x0000:
             nick = _decode_ssi_nick(tlvs.get(0x0131, b""))
+            pending_auth = (0x0066 in tlvs)
             contacts.append(Contact(uin=name, name=nick,
-                                    group_id=group_id, item_id=item_id))
+                                    group_id=group_id, item_id=item_id,
+                                    pending_auth=pending_auth))
 
     return groups, contacts
 
@@ -1159,29 +1164,94 @@ class ICQClient:
 
 
     async def send_auth_request(self, to_uin: str, message: str = ""):
+        """
+        SNAC 13/18: BYTE(uin_len) + uin + WORD(reason_len) + reason + WORD(chs_flg=0)
+
+        Структура по process_ssi_auth_req на сервере (iserverd):
+          to_uin  = read_buin(pack)          — BYTE(len) + uin
+          reason  = v7_extract_string(pack)  — WORD(len) + string
+          chs_flg = pack >> WORD             — всегда читается, 0 = нет charset
+
+        WORD(0x0000) в конце обязателен — без него сервер может не пробросить
+        запрос целевому пользователю.
+        """
         uin_b = to_uin.encode("ascii")
         msg_b = message.encode("utf-8")
         payload = (struct.pack("!B", len(uin_b)) + uin_b
-                + struct.pack("!H", len(msg_b)) + msg_b)
-                # НЕТ 0x0000 в конце
+                 + struct.pack("!H", len(msg_b)) + msg_b
+                 + struct.pack("!H", 0x0000))  # chs_flg = 0
         await self._send_snac(0x0013, SSI_AUTH_SEND_REQ, payload)
         log.info(f"send_auth_request → {to_uin}")
         
 
     async def send_auth_reply(self, to_uin: str, granted: bool, message: str = ""):
         """
-        SNAC 13/1A: BYTE uin_len + uin + BYTE flag + WORD msg_len + STRING msg
-        Без финального 0x0000 — его нет в спецификации!
+        SNAC 13/1A: BYTE(uin_len) + uin + BYTE(flag) + WORD(msg_len) + msg + WORD(charset_flag)
+
+        Структура по process_ssi_auth_rep на сервере (iserverd):
+          read_buin()          — BYTE(uin_len) + uin
+          pack >> auth_state   — BYTE: 1=grant, 0=deny
+          v7_extract_string()  — WORD(len) + string (reason/message)
+          pack >> chs_flg      — WORD: charset flag (0 = нет charset)
+
+        WORD(0x0000) в конце обязателен — сервер всегда читает charset_flag,
+        и если пакет обрывается раньше, grant_ssi_authorization не вызывается.
         """
         uin_b = to_uin.encode("ascii")
         msg_b = message.encode("utf-8")
         auth_byte = 0x01 if granted else 0x00
         payload = (struct.pack("!B", len(uin_b)) + uin_b
-                + struct.pack("!B", auth_byte)
-                + struct.pack("!H", len(msg_b)) + msg_b)
-                # НЕТ 0x0000 в конце!
+                 + struct.pack("!B", auth_byte)
+                 + struct.pack("!H", len(msg_b)) + msg_b
+                 + struct.pack("!H", 0x0000))  # charset_flag = 0
         await self._send_snac(0x0013, SSI_AUTH_SEND_REPLY, payload)
         log.info(f"send_auth_reply → {to_uin}: {'granted' if granted else 'denied'}")
+
+
+    async def set_require_auth(self, require: bool) -> bool:
+        """
+        Включает/выключает требование авторизации для своего аккаунта.
+
+        Использует META_INFO_SET_PERMS (подкоманда 0x0424) SNAC 0x15/0x02.
+        Сервер (iserverd) читает три байта подряд из TLV-тела:
+          BYTE auth      — 0=требовать авторизацию, 1=не требовать (инвертировано!)
+          BYTE webaware  — сохраняем текущее значение из my_info
+          BYTE dc_perms  — сохраняем текущее значение (1 = только из списка контактов)
+
+        Значение auth=0 означает «требовать авторизацию» (userinfo.auth != 1 → ошибка).
+        """
+        META_INFO_SET_PERMS = 0x0424
+        META_INFO_PERMS_ACK = 0x00A0
+
+        # auth=0 → требовать авторизацию; auth=1 → не требовать
+        auth_byte    = 0 if require else 1
+        webaware     = 0
+        dc_perms     = 1
+        if self.my_info:
+            # Сохраняем остальные флаги если анкета уже загружена
+            pass  # webaware/dc_perms не хранятся в UserInfo, используем дефолты
+
+        body = struct.pack("BBB", auth_byte, webaware, dc_perms)
+
+        seq = self._next_meta_seq()
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_save[seq] = fut
+
+        payload = _make_meta_snac(self.uin, META_INFO_SET_PERMS, body, seq_id=seq)
+        await self._send_snac(0x0015, 0x0002, payload)
+        log.info(f"set_require_auth({require}): sending SET_PERMS, auth_byte={auth_byte}")
+
+        try:
+            result = await asyncio.wait_for(fut, timeout=10.0)
+            if result and self.my_info:
+                self.my_info.auth_required = require
+            log.info(f"set_require_auth({require}) -> {'ok' if result else 'FAILED'}")
+            return result
+        except asyncio.TimeoutError:
+            self._pending_save.pop(seq, None)
+            log.warning("set_require_auth: timeout")
+            return False
 
 
     async def request_my_info(self):
@@ -1383,7 +1453,8 @@ class ICQClient:
 
 
     def _pack_contact_entry(self, uin: str, group_id: int, item_id: int,
-                            nick: str = "", include_nick: bool = True) -> bytes:
+                            nick: str = "", include_nick: bool = True,
+                            auth_required: bool = False) -> bytes:
         """
         Формирует SSI-запись контакта по packRosterItem(cItem, groupID) из Jimm.
 
@@ -1400,12 +1471,13 @@ class ICQClient:
         entry += struct.pack("!H", len(name_b)) + name_b
         entry += struct.pack("!HHH", group_id, item_id, 0x0000)
 
+        tlvs = bytearray()
         if include_nick and nick:
             nick_b = nick.encode("utf-8")
-            nick_tlv = struct.pack("!HH", 0x0131, len(nick_b)) + nick_b
-            entry += struct.pack("!H", len(nick_tlv)) + nick_tlv
-        else:
-            entry += struct.pack("!H", 0)
+            tlvs += struct.pack("!HH", 0x0131, len(nick_b)) + nick_b
+        if auth_required:
+            tlvs += struct.pack("!HH", 0x0066, 0)  # TLV 0x0066: авторизация не выдана
+        entry += struct.pack("!H", len(tlvs)) + tlvs
 
         return bytes(entry)
 
@@ -1437,7 +1509,8 @@ class ICQClient:
         return bytes(entry)
 
     async def add_contact(self, uin: str, nick: str = "",
-                          group_id: int = 0) -> bool:
+                          group_id: int = 0,
+                          auth_required: bool = False) -> bool:
         """
         Добавляет пользователя в контакт-лист строго по UpdateContactListAction.java.
 
@@ -1448,9 +1521,13 @@ class ICQClient:
           4. CLI_ROSTERUPDATE (0x13/0x09) — обновляем группу со списком item_id
           5. CLI_ADDEND    (0x13/0x12)
         """
-        if uin in self.contacts:
-            log.info(f"add_contact: {uin} уже есть в контакт-листе, пропускаем")
+        existing = self.contacts.get(uin)
+        if existing and existing.item_id != 0:
+            # Контакт уже в SSI (item_id != 0 означает реальную SSI-запись)
+            log.info(f"add_contact: {uin} уже есть в контакт-листе (item_id={existing.item_id:#06x}), пропускаем")
             return False
+        # Если item_id == 0 — контакт появился только через buddy_online (временный объект),
+        # SSI-записи нет — продолжаем добавление
 
         item_id  = self._rand_item_id()
         nick_str = nick or uin
@@ -1461,19 +1538,26 @@ class ICQClient:
 
         await self._send_snac(0x0013, CLI_ADDSTART_CMD)
 
-        entry = self._pack_contact_entry(uin, group_id, item_id, nick_str)
+        entry = self._pack_contact_entry(uin, group_id, item_id, nick_str,
+                                            auth_required=auth_required)
         await self._send_snac(0x0013, CLI_ROSTERADD_CMD, entry)
         log.info(f"add_contact: {uin} ({nick_str}) → группа {group_id}, item_id={item_id:#06x}")
 
         try:
-            ok = await asyncio.wait_for(fut, timeout=10.0)
+            ack = await asyncio.wait_for(fut, timeout=10.0)
         except asyncio.TimeoutError:
             self._pending_ssi_ack.pop(item_id, None)
             log.warning(f"add_contact {uin}: timeout waiting for ACK")
             await self._send_snac(0x0013, CLI_ADDEND_CMD)
             return False
 
-        if ok:
+        # ack == True: добавлен без авторизации
+        # ack == "auth_required": сервер требует авторизацию от добавляемого
+        # ack == False: ошибка
+        ok = (ack is True)
+        needs_auth = (ack == "auth_required")
+
+        if ok or needs_auth:
             group = self.groups.get(group_id)
             group_name = group.name if group else f"Group{group_id}"
             existing_ids = [c.item_id for c in self.contacts.values()
@@ -1482,10 +1566,28 @@ class ICQClient:
             group_entry = self._pack_group_entry(group_id, group_name, existing_ids)
             await self._send_snac(0x0013, CLI_ROSTERUPDATE_CMD, group_entry)
 
-            c = Contact(uin=uin, name=nick_str, group_id=group_id, item_id=item_id)
+            # Сохраняем статус если контакт уже известен (мог прийти через buddy_online раньше SSI)
+            prev_status   = self.contacts[uin].status   if uin in self.contacts else Status.OFFLINE
+            prev_client   = self.contacts[uin].client   if uin in self.contacts else ""
+            prev_xstatus  = self.contacts[uin].xstatus  if uin in self.contacts else ""
+            c = Contact(uin=uin, name=nick_str, group_id=group_id, item_id=item_id,
+                        pending_auth=(auth_required or needs_auth))
+            c.status  = prev_status
+            c.client  = prev_client
+            c.xstatus = prev_xstatus
             self.contacts[uin] = c
 
         await self._send_snac(0x0013, CLI_ADDEND_CMD)
+
+        if ok and auth_required:
+            await self.send_auth_request(uin)
+        elif needs_auth:
+            # Сервер требует авторизацию — отправляем запрос автоматически
+            log.info(f"add_contact {uin}: auth required by target, sending auth request")
+            await self.send_auth_request(uin)
+
+        if needs_auth:
+            return "auth_required"
         return ok
 
     async def create_group(self, name: str) -> Tuple[bool, Optional["Group"]]:
@@ -2431,6 +2533,7 @@ class ICQClient:
             return
         fam, sub = struct.unpack_from("!HH", data, 0)
         if   fam == 0x0013 and sub == 0x0006: await self._handle_ssi(data[10:])
+        elif fam == 0x0013 and sub == 0x000F: await self._handle_ssi_update(data)
         elif fam == 0x0013 and sub == 0x000E: await self._handle_ssi_ack(data)
         elif fam == 0x0013 and sub == SSI_AUTH_REQ:       await self._handle_ssi_auth_request(data)
         elif fam == 0x0013 and sub == SSI_AUTH_REPLY:     await self._handle_ssi_auth_reply(data)
@@ -2441,6 +2544,7 @@ class ICQClient:
         elif fam == 0x0004 and sub == 0x0007: await self._handle_message(data)
         elif fam == 0x0004 and sub == 0x000B: await self._handle_server_relay(data)
         elif fam == 0x0004 and sub == 0x0014: await self._handle_typing(data)
+        else: log.debug(f"unhandled SNAC {fam:#06x}/{sub:#06x} ({len(data)}b): {data[:20].hex()}")
 
 
     async def _handle_ssi(self, data: bytes):
@@ -2457,22 +2561,96 @@ class ICQClient:
                          list(self.contacts.values()))
 
 
+    async def _handle_ssi_update(self, data: bytes):
+        """
+        SNAC 0x13/0x0F: сервер сообщает об изменении SSI-записи.
+
+        iserverd посылает этот пакет через send_item_auth_update с нестандартной
+        преамбулой из 8 байт перед SSI-записью:
+          WORD(0x0006) WORD(0x0001) WORD(0x0002) WORD(0x0004)
+        за которой идёт стандартная SSI-запись:
+          WORD(name_len) + name + WORD(gid) + WORD(iid) + WORD(type) + WORD(tlv_len) + tlvs
+
+        Парсим обоими способами (со смещением и без), чтобы обработать и
+        этот нестандартный формат, и любой стандартный 13/0F если он придёт.
+        """
+        try:
+            log.debug(f"SSI update (13/0F) {len(data)}b: {data[:48].hex()}")
+            body = data[10:]  # пропускаем SNAC header
+
+            def _parse_ssi_entries(buf, start):
+                """Разбирает SSI-записи начиная с offset start, возвращает список (name, tlv_data)."""
+                pos = start
+                result = []
+                while pos + 10 <= len(buf):
+                    name_len = struct.unpack_from("!H", buf, pos)[0]
+                    # Санитарная проверка: имя UIN — только цифры, длина 5–12
+                    if name_len < 5 or name_len > 64 or pos + 2 + name_len + 8 > len(buf):
+                        break
+                    name      = buf[pos+2:pos+2+name_len].decode("utf-8", errors="ignore")
+                    pos2      = pos + 2 + name_len
+                    _gid      = struct.unpack_from("!H", buf, pos2)[0]
+                    _iid      = struct.unpack_from("!H", buf, pos2+2)[0]
+                    item_type = struct.unpack_from("!H", buf, pos2+4)[0]
+                    tlv_len   = struct.unpack_from("!H", buf, pos2+6)[0]
+                    end       = pos2 + 8 + tlv_len
+                    if end > len(buf):
+                        break
+                    tlv_data  = buf[pos2+8:end]
+                    result.append((name, item_type, tlv_data))
+                    pos = end
+                return result
+
+            # Попробуем стандартный offset=0, потом со смещением +8 (iserverd auth_update)
+            entries = _parse_ssi_entries(body, 0)
+            if not entries:
+                entries = _parse_ssi_entries(body, 8)
+
+            updated_uins = []
+            for name, item_type, tlv_data in entries:
+                if item_type == 0x0000 and name in self.contacts:
+                    tlvs        = _parse_tlvs(tlv_data)
+                    old_pending = self.contacts[name].pending_auth
+                    new_pending = (0x0066 in tlvs)
+                    if old_pending != new_pending:
+                        self.contacts[name].pending_auth = new_pending
+                        log.info(f"SSI 13/0F: {name} pending_auth {old_pending}→{new_pending}")
+                        updated_uins.append(name)
+
+            for uin in updated_uins:
+                c = self.contacts.get(uin)
+                if c:
+                    await self._fire(self.on_contact_status, c)
+        except Exception as e:
+            log.warning(f"_handle_ssi_update error: {e}", exc_info=True)
+
     async def _handle_ssi_ack(self, data: bytes):
         """
         Разбирает SNAC 0x13/0x0E (SRV_UPDATEACK).
-        Структура: SNAC(10) + LE(result:2) per entry.
+        Структура: SNAC(10) + BE(result:2) per entry.
         Резолвит future по item_id из _pending_ssi_ack.
+
+        Коды результата:
+          0x0000 — успех
+          0x000E — SSI_UPDATE_AUTH_REQUIRED: цель требует авторизацию
+          другие — ошибка добавления
         """
+        SSI_UPDATE_AUTH_REQUIRED = 0x000E
         try:
             pos = 10
             if pos + 2 > len(data):
                 return
             result = struct.unpack_from("!H", data, pos)[0]
-            ok = (result == 0x0000)
-            log.debug(f"SSI ack: result={result:#06x} ({'OK' if ok else 'ERR'})")
+            if result == 0x0000:
+                value = True
+            elif result == SSI_UPDATE_AUTH_REQUIRED:
+                value = "auth_required"
+            else:
+                value = False
+            log.debug(f"SSI ack: result={result:#06x} → {value!r}")
             for item_id, fut in list(self._pending_ssi_ack.items()):
                 if not fut.done():
-                    fut.set_result(ok)
+                    fut.set_result(value)
                 del self._pending_ssi_ack[item_id]
                 break
         except Exception as e:
@@ -2526,50 +2704,65 @@ class ICQClient:
 
 
     async def _handle_ssi_auth_request(self, data: bytes):
+        """
+        SNAC 0x13/0x18: входящий запрос авторизации от другого пользователя.
+
+        Структура пакета (iserverd, ssi_send_auth_req):
+          [0..9]   SNAC header
+          [10..17] 8 байт преамбулы: WORD(0x0006) WORD(0x0001) WORD(0x0002) WORD(0x0002)
+          [18]     BYTE(uin_len)
+          [19..]   uin (ASCII цифры)
+          [19+L]   WORD(reason_len) + reason bytes
+          [...]    WORD(chs_flg)
+          [если chs_flg != 0] WORD(unk) + WORD(charset_len) + charset
+        """
         try:
-            log.debug(f"SSI auth raw ({len(data)} bytes): {data.hex(' ')}")
-            pos = 10
+            log.debug(f"SSI auth_req raw ({len(data)}b): {data.hex()}")
 
-
-            uin = None
-            for i in range(pos, len(data)):
-                if 48 <= data[i] <= 57:
-                    start = i
-                    while i < len(data) and 48 <= data[i] <= 57:
-                        i += 1
-                    uin = data[start:i].decode('ascii')
-                    pos = i
-                    break
-            if uin is None:
+            # SNAC header = 10 байт, преамбула сервера = 8 байт
+            pos = 18  # 10 + 8
+            if pos >= len(data):
+                log.warning("auth_req: пакет слишком короткий")
                 return
 
+            uin_len = data[pos]; pos += 1
+            if pos + uin_len > len(data):
+                log.warning("auth_req: UIN выходит за границы пакета")
+                return
+            uin = data[pos:pos+uin_len].decode("ascii", errors="ignore"); pos += uin_len
 
-            if pos < len(data) and data[pos] == 0x00:
-                pos += 1
+            if not uin.isdigit():
+                log.warning(f"auth_req: невалидный UIN {uin!r}, попробуем сдвиг")
+                # Fallback: преамбула может отсутствовать (нестандартный клиент)
+                pos = 10
+                uin_len = data[pos]; pos += 1
+                uin = data[pos:pos+uin_len].decode("ascii", errors="ignore"); pos += uin_len
+                if not uin.isdigit():
+                    log.warning(f"auth_req: UIN не найден, пакет: {data.hex()}")
+                    return
 
+            # reason: WORD(len) + bytes
+            if pos + 2 > len(data):
+                message = ""
+            else:
+                reason_len = struct.unpack_from("!H", data, pos)[0]; pos += 2
+                raw_reason = data[pos:pos+reason_len]; pos += reason_len
 
-            if pos + 1 < len(data) and data[pos+1] >= 0xC0:
-                pos += 1
+                # charset: WORD(chs_flg), если != 0 то WORD(unk) + WORD(cs_len) + charset
+                charset = "utf-8"
+                if pos + 2 <= len(data):
+                    chs_flg = struct.unpack_from("!H", data, pos)[0]; pos += 2
+                    if chs_flg and pos + 4 <= len(data):
+                        pos += 2  # unk_flg
+                        cs_len = struct.unpack_from("!H", data, pos)[0]; pos += 2
+                        if pos + cs_len <= len(data) and cs_len > 0:
+                            charset = data[pos:pos+cs_len].decode("ascii", errors="ignore")
 
+                try:
+                    message = raw_reason.decode(charset).rstrip("\x00")
+                except Exception:
+                    message = raw_reason.decode("latin-1", errors="replace").rstrip("\x00")
 
-            msg_start = pos
-            msg_end = msg_start
-            while msg_end + 4 <= len(data):
-                if data[msg_end:msg_end+4] == b'\x00\x01\x00\x01':
-                    break
-                msg_end += 1
-            raw_msg = data[msg_start:msg_end]
-
-
-            charset = "utf-8"
-            for i in range(msg_end, len(data)-4):
-                if data[i] == 0x00 and data[i+1] == 0x05:
-                    tlv_len = struct.unpack_from("!H", data, i+2)[0]
-                    if i+4+tlv_len <= len(data):
-                        charset = data[i+4:i+4+tlv_len].decode('ascii', errors='ignore')
-                    break
-
-            message = raw_msg.decode(charset, errors='replace')
             log.info(f"Auth request from {uin}: {message!r}")
             await self._fire(self.on_auth_request, uin, message)
 
@@ -2579,36 +2772,66 @@ class ICQClient:
 
     async def _handle_ssi_auth_reply(self, data: bytes):
         """
-        Сервер прислал SNAC 0x13/0x1B — ответ на send_auth_request().
+        SNAC 0x13/0x1B: ответ сервера на наш запрос авторизации.
 
-        Структура (после SNAC-заголовка 10 байт):
-          BYTE(uin_len) + uin_ascii
-          BYTE(auth_state)  — 0x01=granted, 0x00=denied
-          BE(msg_len:2) + message_bytes
-          BE(charset_flag:2)
-
-        Вызывает on_auth_reply(uin: str, granted: bool, message: str).
+        Реальная структура (подтверждена hex-дампом):
+          [0..9]   SNAC header (fam, sub, flags, reqid)
+          [10..17] 8 байт SSI-контекста (4 × WORD)
+          [18]     BYTE(uin_len)
+          [19..]   uin_bytes (ASCII цифры)
+          [19+uin_len]  BYTE: 0x00=denied, 0x01=granted
+          [20+uin_len]  WORD(msg_len) + msg  (опционально)
         """
         try:
-            pos = 10
-            if pos >= len(data):
+            log.warning(f"SSI auth_reply raw ({len(data)}b): {data.hex()}")
+
+            # Ищем блок BYTE(uin_len)+uin в диапазоне offset 10..25
+            def _find_uin(start_pos, limit):
+                for pos in range(start_pos, min(limit, len(data))):
+                    uin_len = data[pos]
+                    if uin_len < 5 or uin_len > 12:
+                        continue
+                    end_pos = pos + 1 + uin_len
+                    if end_pos >= len(data):
+                        continue
+                    uin_bytes = data[pos+1:end_pos]
+                    if all(48 <= b <= 57 for b in uin_bytes):
+                        return pos, uin_bytes.decode("ascii")
+                return None, None
+
+            pos_uin, uin = _find_uin(10, 26)
+            if uin is None:
+                log.warning(f"auth_reply: UIN не найден: {data.hex()}")
                 return
-            uin_len = data[pos]; pos += 1
-            uin = data[pos:pos + uin_len].decode("ascii", errors="ignore"); pos += uin_len
-            if pos >= len(data):
+
+            pos_state = pos_uin + 1 + len(uin)
+            if pos_state >= len(data):
+                log.warning("auth_reply: нет auth_state байта")
                 return
-            auth_state = data[pos]; pos += 1
+
+            auth_state = data[pos_state]
             granted = (auth_state == 0x01)
+
             message = ""
-            if pos + 2 <= len(data):
-                msg_len = struct.unpack_from("!H", data, pos)[0]; pos += 2
-                raw_msg = data[pos:pos + msg_len]
-                message = raw_msg.decode("utf-8", errors="replace").rstrip("\x00")
-            log.info(f"Auth reply from {uin}: {'granted' if granted else 'denied'} — {message!r}")
+            p = pos_state + 1
+            if p + 2 <= len(data):
+                msg_len = struct.unpack_from("!H", data, p)[0]; p += 2
+                if 0 < msg_len <= len(data) - p:
+                    raw = data[p:p+msg_len]
+                    try:    message = raw.decode("utf-8").rstrip("\x00")
+                    except Exception: message = raw.decode("latin-1").rstrip("\x00")
+
+            log.info(f"Auth reply: uin={uin} state={auth_state:#04x} "
+                     f"({'GRANTED' if granted else 'DENIED'}) msg={message!r}")
+
+            if granted and uin in self.contacts:
+                # Сервер сам снимает TLV 0x0066, добавляет контакт в online_contacts
+                # и начинает слать присутствие (send_item_auth_update + db_contact_insert
+                # в grant_ssi_authorization на сервере) — нам ничего делать не нужно.
+                self.contacts[uin].pending_auth = False
             await self._fire(self.on_auth_reply, uin, granted, message)
         except Exception as e:
             log.error(f"_handle_ssi_auth_reply error: {e}", exc_info=True)
-
 
     async def _handle_ssi_you_were_added(self, data: bytes):
         """
@@ -2674,12 +2897,26 @@ class ICQClient:
                 await self._send_snac(0x0015, 0x0002, ack_payload)
                 return
 
-            if subtype == 0x0C3F:
-                fut = self._pending_save.pop(seq_id, None)
-                if fut and not fut.done():
-                    fut.set_result(success == 0x0A)
-                return
+            # Диспетчеризация по seq_id, а не по subtype — ряд subtypes совпадают
+            # между ACK сохранения (0x00DC=MORE_ACK, 0x00FA=AFFILIATIONS_ACK) и
+            # ответами на запрос анкеты (0x00DC=more_info, 0x00FA=end).
+            # seq_id уникален: один seq не может быть одновременно в pending_save и pending_info.
 
+            # 1. Проверяем pending_save по seq_id
+            if seq_id in self._pending_save:
+                save_subtypes = (0x0C3F,   # ACK для CLI_SET_FULLINFO
+                                 0x00A0,   # META_INFO_PERMS_ACK
+                                 0x00DC,   # ACK для SET_HOMEINFO
+                                 0x00F0,   # ACK для SET_WORKINFO
+                                 0x00FA,   # ACK для SET_MOREINFO
+                                 )
+                if subtype in save_subtypes:
+                    fut = self._pending_save.pop(seq_id, None)
+                    if fut and not fut.done():
+                        fut.set_result(success == 0x0A)
+                    return
+
+            # 2. Проверяем pending_info по seq_id
             entry = self._pending_info.get(seq_id)
             if entry is None and self._pending_info:
                 info_subtypes = {SRV_META_GENERAL_TYPE, SRV_META_MORE_TYPE,
@@ -2722,14 +2959,26 @@ class ICQClient:
         pos = 0
 
         if subtype == SRV_META_GENERAL_TYPE:
-            fields = ["nick","first_name","last_name","email","city",
-                      "state","phone","fax","address","cell_phone"]
-            for f in fields:
+            # nick, first, last, email, city, state, phone, fax, address, cell
+            str_fields = ["nick","first_name","last_name","email","city",
+                          "state","phone","fax","address","cell_phone"]
+            for f in str_fields:
                 val, pos = _read_asciiz_le(payload, pos)
                 setattr(info, f, val)
+            # Далее по структуре mr_send_home_info (sn15_ext_messages.cpp):
+            # zip(str), country(u16), gmt_offset(s8), auth(u8), webaware(u8), iphide(u8), e1publ(u8)
+            _, pos = _read_asciiz_le(payload, pos)  # zip
+            pos += 2                                  # country (u16)
+            pos += 1                                  # gmt_offset (s8)
+            if pos < len(payload):
+                auth_byte = payload[pos]; pos += 1
+                # сервер: auth=0 → требовать авторизацию, auth=1 → не требовать
+                info.auth_required = (auth_byte == 0)
             expected.discard(SRV_META_GENERAL_TYPE)
 
         elif subtype == SRV_META_MORE_TYPE:
+            # age(u16), gender(u8), hpage(str), byear(u16), bmonth(u8), bday(u8),
+            # lang1(u8), lang2(u8), lang3(u8) — auth в этом пакете не передаётся
             if pos + 2 <= len(payload):
                 info.age = struct.unpack_from("<H", payload, pos)[0]; pos += 2
             if pos < len(payload):
