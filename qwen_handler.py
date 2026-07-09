@@ -217,7 +217,7 @@ class ChatMessage:
 
 class QwenHandler:
     def __init__(self, api_url: str = "https://qwen.aikit.club/v1/chat/completions",
-                 api_key: str = None, model: str = "qwen3-max"):
+                 api_key: str = None, model: str = "qwen3.7-max"):
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
