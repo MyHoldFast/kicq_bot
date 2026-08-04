@@ -28,30 +28,34 @@ class AuthError(ConnectionError):
     pass
 
 
-SERVER = "195.66.114.37"
+SERVER = "195.66.114.37" #"195.66.114.37"
 PORT   = 5190
 
 ICQ_MAX_CHARS = 2000
 
 
-CAP_QIP2005         = bytes.fromhex("563FC8090B6F41514950203230303561")
-CAP_TYPING          = bytes.fromhex("563FC8090B6F41BD9F79422609DFA2F3")
-CAP_RTF             = bytes.fromhex("97B12751243C4334AD22D6ABF73F1492")
-CAP_AIM_SERVERRELAY = bytes.fromhex("094613494C7F11D18222444553540000")
-CAP_UTF8            = bytes.fromhex("0946134E4C7F11D18222444553540000")
-CAP_XTRAZ           = bytes.fromhex("1A093C6CD7FD4EC59D51A6474E34F5A0")
+CAP_QIP2005          = bytes.fromhex("563FC8090B6F41514950203230303561")
+CAP_QIP_GENERIC      = bytes.fromhex("563FC8090B6F41514950202020202021")
+CAP_TYPING           = bytes.fromhex("563FC8090B6F41BD9F79422609DFA2F3")
+CAP_RTF              = bytes.fromhex("97B12751243C4334AD22D6ABF73F1492")
+CAP_AIM_SERVERRELAY  = bytes.fromhex("094613494C7F11D18222444553540000")
+CAP_UTF8             = bytes.fromhex("0946134E4C7F11D18222444553540000")
+CAP_XTRAZ            = bytes.fromhex("1A093C6CD7FD4EC59D51A6474E34F5A0")
 
-CAP_JIMM    = bytes.fromhex("97B12751243C4334AD22D6ABF73F1409")
-CAP_MIRANDA = bytes.fromhex("4D6972616E64614D61696E0000000000")
+# Уточнено по декомпилированному исходнику Jimm (class_20.java):
+# прежние значения CAP_JIMM/CAP_MIRANDA не соответствовали реальным байтам.
+CAP_JIMM    = bytes.fromhex("4A696D6D200000000000000000000000")
+CAP_MIRANDA = bytes.fromhex("4D6972616E64614D0006030000030807")
 CAP_ICQ6    = bytes.fromhex("3B7248ED5EDE4D6993F729D5BDF8A27F")
 CAP_ICQ7    = bytes.fromhex("3FF19BEB53714657BCDEA39142E55D99")
 
 KNOWN_CAPS: Dict[bytes, str] = {
-    CAP_QIP2005: "QIP 2005a",
-    CAP_JIMM:    "Jimm",
-    CAP_MIRANDA: "Miranda",
-    CAP_ICQ6:    "ICQ 6",
-    CAP_ICQ7:    "ICQ 7",
+    CAP_QIP2005:     "QIP 2005a",
+    CAP_QIP_GENERIC: "QIP",
+    CAP_JIMM:        "Jimm",
+    CAP_MIRANDA:     "Miranda",
+    CAP_ICQ6:        "ICQ 6",
+    CAP_ICQ7:        "ICQ 7",
     b'Jasmine ICQ ####': "Jasmine",
     b'Jasmine ver\xff\x05\x05\x03\x00': "Jasmine",
 }
@@ -361,6 +365,16 @@ SAVE_TLV_ABOUT     = 0x0258
 SAVE_TLV_GENDER    = 0x017C
 # SAVE_TLV_AUTH_REQUIRED не используется: auth управляется через META_INFO_SET_PERMS (0x0424)
 
+# Смена пароля — META_INFO_SET_PASSWORD (по EditInfo.java из Jimm и
+# mr_set_user_pass_info из iserverd, isdcore/v7_proto/snac_families/sn15_ext_messages.cpp).
+# Jimm пишет подкоманду как Util.putWord(buf, 0, 0x2e04) big-endian (байты 2E 04),
+# что при чтении сервером как LE-слово даёт 0x042E — это и есть META_INFO_SET_PASSWORD
+# из v7_defines.h iserverd. Тело — НЕ TLV-цепочка, а «сырая» строка формата
+# v7_extract_string: LE(length:2) + сами байты пароля, без нуль-терминатора
+# (max_len=32, char password[33] на сервере).
+META_INFO_SET_PASSWORD = 0x042E
+META_INFO_PASS_ACK     = 0x00AA   # ack для set password packet (v7_defines.h)
+
 CLI_ROSTERADD_CMD    = 0x0008   # добавить запись SSI
 CLI_ROSTERDELETE_CMD = 0x000A   # удалить запись SSI
 SRV_UPDATEACK_CMD    = 0x000E   # подтверждение от сервера
@@ -459,6 +473,31 @@ def _make_meta_snac(my_uin: str, subtype: int,
     length_field = 8 + this_data_len
 
     tlv_body = struct.pack("<H", length_field) + bytes(inner)
+    return _make_tlv(0x0001, tlv_body)
+
+
+def _make_offline_req_snac(my_uin: str, req_cmd: int,
+                           extra: bytes = b"") -> bytes:
+    """
+    Строит payload SNAC 0x15/0x02 для запросов оффлайн-очереди верхнего
+    уровня (META_REQ_OFFLINE_MSG / META_ACK_OFFLINE_MSG).
+
+    В отличие от _make_meta_snac (который всегда оборачивает данные в
+    req_cmd=META_REQ_INFORMATION/0x07D0 — это подходит только для
+    подкоманд META_INFO_*), здесь req_cmd пишется напрямую, как этого
+    ожидает process_ime_multi_req на сервере (sn15_ext_messages.cpp):
+
+      TLV(0x0001):
+        LE(remaining_size:2) = 4(uin) + 2(req_cmd) + len(extra)
+        LE(uin:4)
+        LE(req_cmd:2)        ← META_REQ_OFFLINE_MSG (0x003C) или
+                                META_ACK_OFFLINE_MSG (0x003E)
+        <extra>               ← LE(req_seq:2) для META_REQ_OFFLINE_MSG,
+                                ничего для META_ACK_OFFLINE_MSG
+    """
+    uin_int = int(my_uin)
+    body = struct.pack("<I", uin_int) + struct.pack("<H", req_cmd) + extra
+    tlv_body = struct.pack("<H", len(body)) + body
     return _make_tlv(0x0001, tlv_body)
 
 
@@ -1092,6 +1131,7 @@ class ICQClient:
         self.on_auth_request:    Optional[Callable] = None
         self.on_auth_reply:      Optional[Callable] = None
         self.on_you_were_added:  Optional[Callable] = None
+        self.on_password_changed: Optional[Callable] = None
 
 
     async def set_status(self, status: Status, message: str = ""):
@@ -1158,7 +1198,8 @@ class ICQClient:
         Обычно вызывается один раз сразу после on_connected / on_roster.
         """
         seq_id = self._next_meta_seq()
-        payload = _make_meta_snac(self.uin, META_REQ_OFFLINE_MSG, seq_id=seq_id)
+        extra = struct.pack("<H", seq_id)
+        payload = _make_offline_req_snac(self.uin, META_REQ_OFFLINE_MSG, extra=extra)
         await self._send_snac(0x0015, 0x0002, payload)
         log.debug(f"request_offline_messages: seq={seq_id}")
 
@@ -1253,6 +1294,72 @@ class ICQClient:
             log.warning("set_require_auth: timeout")
             return False
 
+
+    async def change_password(self, new_password: str,
+                               current_password: Optional[str] = None) -> bool:
+        """
+        Меняет пароль аккаунта на ICQ-сервере.
+
+        Использует META_INFO_SET_PASSWORD (подкоманда 0x042E) SNAC 0x15/0x02 —
+        строго по EditInfo.java (Jimm, обработчик команды _CmdChange) и
+        mr_set_user_pass_info (iserverd, sn15_ext_messages.cpp).
+
+        В отличие от save_my_info/set_require_auth, тело запроса — это НЕ
+        TLV-цепочка (SAVE_TLV_*), а «сырая» строка в формате v7_extract_string,
+        который использует сервер для пароля:
+            LE(length : 2) + password_bytes   (без нуль-терминатора)
+        Сервер хранит пароль в char[33] и ограничивает длину 32 байтами
+        (см. v7_extract_string(password, tlv, sizeof(password)-1, ...)).
+
+        current_password — необязательная клиентская проверка (как в Jimm,
+        где смена блокируется, если введённый "текущий" пароль не совпадает
+        с сохранённым). Сервер сам текущий пароль не запрашивает и не проверяет,
+        поэтому эта сверка — только защита от опечаток на стороне клиента.
+
+        Возвращает True, если сервер подтвердил смену (META_INFO_PASS_ACK,
+        success=0x0A). При успехе обновляет self.password, чтобы последующие
+        переподключения (в т.ч. автоматические) использовали новый пароль.
+
+        Дополнительно вызывает колбэк on_password_changed(success: bool) —
+        и при успехе/ошибке от сервера, и при таймауте (success=False).
+        Использовать можно и то, и другое: await client.change_password(...)
+        для получения результата в месте вызова, и/или колбэк, если решение
+        принимается где-то ещё в асинхронном клиенте.
+        """
+        if current_password is not None and current_password != self.password:
+            log.warning("change_password: указанный текущий пароль не совпадает, отмена")
+            return False
+
+        pw_bytes = new_password.encode("utf-8")
+        if not (1 <= len(pw_bytes) <= 32):
+            log.warning("change_password: пароль должен быть от 1 до 32 байт")
+            return False
+
+        seq  = self._next_meta_seq()
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_save[seq] = fut
+
+        # LE(length:2) + пароль + нуль-терминатор (как в Jimm; сервер его не
+        # читает, т.к. v7_extract_string сама останавливается по length, но
+        # он безвреден и повышает совместимость с другими реализациями сервера).
+        body = struct.pack("<H", len(pw_bytes)) + pw_bytes + b"\x00"
+        payload = _make_meta_snac(self.uin, META_INFO_SET_PASSWORD, body, seq_id=seq)
+        await self._send_snac(0x0015, 0x0002, payload)
+        log.info("change_password: отправлен запрос SET_PASSWORD")
+
+        try:
+            result = await asyncio.wait_for(fut, timeout=10.0)
+            if result:
+                self.password = new_password
+            log.info(f"change_password -> {'ok' if result else 'FAILED'}")
+            await self._fire(self.on_password_changed, result)
+            return result
+        except asyncio.TimeoutError:
+            self._pending_save.pop(seq, None)
+            log.warning("change_password: timeout")
+            await self._fire(self.on_password_changed, False)
+            return False
 
     async def request_my_info(self):
         """
@@ -2659,25 +2766,53 @@ class ICQClient:
 
     async def _process_offline_message(self, payload: bytes):
         """
-        Разбирает тело одного оффлайн-сообщения (subtype=0x0041).
-
-        Структура payload (после seq+subtype+success в _handle_icq_meta):
-          LE(from_uin:4)
-          LE(year:2) BYTE(month) BYTE(day) BYTE(hour) BYTE(min)  ← UTC timestamp
-          LE(msg_type:2)
-          LE(msg_len:2) + msg_bytes (cp1251 или utf-8)
-
-        Доставляет Message в колбэк on_offline_message.
+        Разбирает тело одного оффлайн-сообщения (subtype=0x0041) из payload SNAC 15/03.
+        Структура payload (после uin+subtype+seq в TLV):
+        LE(from_uin:4)       ← отправитель
+        LE(year:2) BYTE(month) BYTE(day) BYTE(hour) BYTE(min)
+        LE(msg_type:2)
+        LE(msg_len:2) + msg_bytes (с нуль-терминатором)
         """
         try:
             if len(payload) < 8:
                 return
-            from_uin = str(struct.unpack_from("<I", payload, 0)[0])
-            year     = struct.unpack_from("<H", payload, 4)[0]
-            month    = payload[6]
-            day      = payload[7]
-            hour     = payload[8]  if len(payload) > 8 else 0
-            minute   = payload[9]  if len(payload) > 9 else 0
+
+            pos = 0
+
+            # from_uin — отправитель
+            if pos + 4 > len(payload):
+                return
+            from_uin = str(struct.unpack_from("<I", payload, pos)[0])
+            pos += 4
+
+            # Дата/время
+            if pos + 8 > len(payload):
+                return
+            year     = struct.unpack_from("<H", payload, pos)[0]
+            month    = payload[pos + 2]
+            day      = payload[pos + 3]
+            hour     = payload[pos + 4]
+            minute   = payload[pos + 5]
+            pos += 6  # мы прочитали 6 байт (год 2 + месяц 1 + день 1 + час 1 + минута 1)
+
+            # msg_type (2 байта)
+            if pos + 2 > len(payload):
+                return
+            # msg_type = struct.unpack_from("<H", payload, pos)[0]  # не используется
+            pos += 2
+
+            # msg_len и сам текст
+            if pos + 2 > len(payload):
+                return
+            msg_len = struct.unpack_from("<H", payload, pos)[0]
+            pos += 2
+
+            raw = payload[pos:pos + msg_len]
+            # Убираем нуль-терминатор, если есть
+            if raw and raw[-1:] == b"\x00":
+                raw = raw[:-1]
+
+            text = _decode_text(raw) if raw else ""
 
             import calendar
             try:
@@ -2685,20 +2820,14 @@ class ICQClient:
             except Exception:
                 ts = time.time()
 
-            pos = 10
-            if pos + 2 > len(payload):
-                return
-            pos += 2
-            if pos + 2 > len(payload):
-                return
-            msg_len = struct.unpack_from("<H", payload, pos)[0]; pos += 2
-            raw = payload[pos:pos + msg_len]
-            text = _decode_text(raw) if raw else ""
-
             msg = Message(sender_uin=from_uin, text=text,
-                          timestamp=ts, is_outgoing=False)
+                        timestamp=ts, is_outgoing=False)
+            if not text.strip():
+                log.debug(f"Offline message from {from_uin} has empty content, skipping")
+                return
             log.info(f"Offline message from {from_uin}: {text[:60]!r}")
             await self._fire(self.on_offline_message, msg)
+
         except Exception as e:
             log.error(f"_process_offline_message error: {e}", exc_info=True)
 
@@ -2857,94 +2986,89 @@ class ICQClient:
     async def _handle_icq_meta(self, data: bytes):
         """
         Разбирает SNAC 0x15/0x03 (SRV_FROMICQSRV).
-
-        Структура payload (после SNAC-заголовка 10 байт):
-          TLV(0x0001):
-            LE(total_len:2)
-            LE(uin:4)         ← UIN от кого ответ (= наш, т.к. мы запрашивали)
-            LE(0x07DA:2)      ← SRV_META_SUBCMD
-            LE(seq_id:2)      ← наш sequence id
-            LE(subtype:2)     ← тип ответа (0xC8, 0xDC, 0xD2, 0xE6, 0xFA, 0x0C3A)
-            BYTE(success)     ← 0x0A = OK
-            <данные>
+        Оффлайн-сообщения (0x0041, 0x0042) обёрнуты в TLV(0x0001), но имеют
+        другую структуру внутри.
         """
         try:
             pos = 10
             if pos + 4 > len(data):
                 return
-            tlv_type = struct.unpack_from("!H", data, pos)[0]; pos += 2
-            tlv_len  = struct.unpack_from("!H", data, pos)[0]; pos += 2
+
+            tlv_type = struct.unpack_from("!H", data, pos)[0]
+            tlv_len  = struct.unpack_from("!H", data, pos + 2)[0]
+            pos += 4
             if tlv_type != 0x0001 or pos + tlv_len > len(data):
                 return
-            inner = data[pos:pos + tlv_len]
 
-            if len(inner) < 11:
+            inner = data[pos:pos + tlv_len]
+            if len(inner) < 10:
                 return
+
+            # subtype находится на позиции 6 (после remaining_size(2) + uin(4))
+            subtype = struct.unpack_from("<H", inner, 6)[0]
+
+            # ---------- Оффлайн-сообщения (без 0x07DA и без success) ----------
+            if subtype == OFFLINE_MSG_RESPONSE:          # 0x0041
+                seq_id = struct.unpack_from("<H", inner, 8)[0]
+                payload = inner[10:]
+                log.debug(f"Offline message: seq={seq_id}")
+                await self._process_offline_message(payload)
+                return
+
+            if subtype == OFFLINE_MSG_EOF:               # 0x0042
+                log.info("Offline queue end — sending ACK")
+                ack_payload = _make_offline_req_snac(self.uin, META_ACK_OFFLINE_MSG)
+                await self._send_snac(0x0015, 0x0002, ack_payload)
+                return
+
+            # ---------- Обычные meta-ответы (анкета, поиск, ACK) ----------
+            # Структура: [remaining(2)][uin(4)][0x07DA(2)][seq(2)][subtype(2)][success(1)][data]
+            if len(inner) < 13:
+                return
+
             seq_id  = struct.unpack_from("<H", inner, 8)[0]
             subtype = struct.unpack_from("<H", inner, 10)[0]
             success = inner[12] if len(inner) > 12 else 0
             payload = inner[13:]
 
-            log.debug(f"ICQ meta: seq={seq_id} subtype={subtype:#06x} success={success:#04x}")
-
-            if subtype == OFFLINE_MSG_RESPONSE:
-                await self._process_offline_message(payload)
-                return
-
-            if subtype == OFFLINE_MSG_EOF:
-                log.info("Offline queue end — sending ACK")
-                ack_payload = _make_meta_snac(self.uin, META_ACK_OFFLINE_MSG, seq_id=seq_id)
-                await self._send_snac(0x0015, 0x0002, ack_payload)
-                return
-
-            # Диспетчеризация по seq_id, а не по subtype — ряд subtypes совпадают
-            # между ACK сохранения (0x00DC=MORE_ACK, 0x00FA=AFFILIATIONS_ACK) и
-            # ответами на запрос анкеты (0x00DC=more_info, 0x00FA=end).
-            # seq_id уникален: один seq не может быть одновременно в pending_save и pending_info.
-
-            # 1. Проверяем pending_save по seq_id
-            if seq_id in self._pending_save:
-                save_subtypes = (0x0C3F,   # ACK для CLI_SET_FULLINFO
-                                 0x00A0,   # META_INFO_PERMS_ACK
-                                 0x00DC,   # ACK для SET_HOMEINFO
-                                 0x00F0,   # ACK для SET_WORKINFO
-                                 0x00FA,   # ACK для SET_MOREINFO
-                                 )
-                if subtype in save_subtypes:
-                    fut = self._pending_save.pop(seq_id, None)
-                    if fut and not fut.done():
-                        fut.set_result(success == 0x0A)
-                    return
-
-            # 2. Проверяем pending_info по seq_id
-            entry = self._pending_info.get(seq_id)
-            if entry is None and self._pending_info:
-                info_subtypes = {SRV_META_GENERAL_TYPE, SRV_META_MORE_TYPE,
-                                 SRV_META_WORK_TYPE, SRV_META_ABOUT_TYPE, SRV_META_END_TYPE}
-                if subtype in info_subtypes:
-                    fallback_seq, entry = next(iter(self._pending_info.items()))
-                    log.debug(f"info reply: seq mismatch (got {seq_id}, using {fallback_seq})")
-                    seq_id = fallback_seq
-
-            if entry:
-                await self._process_info_reply(seq_id, subtype, success, payload, entry)
-                return
-
-            if seq_id in self._pending_search:
-                await self._process_search_reply(seq_id, subtype, success, payload)
-                return
-
-            if self._pending_search:
-                if subtype in (0x01A4, 0x01AE):
-                    fallback_seq = next(iter(self._pending_search))
-                    log.debug(f"search reply: seq mismatch (got {seq_id}, using {fallback_seq})")
-                    await self._process_search_reply(fallback_seq, subtype, success, payload)
-                    return
-
-            log.debug(f"ICQ meta seq={seq_id}: no pending request found")
+            log.debug(f"ICQ meta TLV: seq={seq_id} subtype={subtype:#06x} success={success:#04x}")
+            await self._dispatch_meta_reply(seq_id, subtype, success, payload)
 
         except Exception as e:
             log.error(f"icq_meta parse error: {e}", exc_info=True)
+
+    async def _dispatch_meta_reply(self, seq_id: int, subtype: int,
+                                   success: int, payload: bytes):
+        """Диспетчеризация meta-ответов (анкета, сохранение, поиск)."""
+        # 1. Проверяем pending_save по seq_id
+        if seq_id in self._pending_save:
+            save_subtypes = (0x0C3F, 0x00A0, 0x00DC, 0x00F0, 0x00FA, META_INFO_PASS_ACK)
+            if subtype in save_subtypes:
+                fut = self._pending_save.pop(seq_id, None)
+                if fut and not fut.done():
+                    fut.set_result(success == 0x0A)
+                return
+
+        # 2. Проверяем pending_info по seq_id
+        entry = self._pending_info.get(seq_id)
+        if entry is None and self._pending_info:
+            info_subtypes = {SRV_META_GENERAL_TYPE, SRV_META_MORE_TYPE,
+                             SRV_META_WORK_TYPE, SRV_META_ABOUT_TYPE, SRV_META_END_TYPE}
+            if subtype in info_subtypes:
+                fallback_seq, entry = next(iter(self._pending_info.items()))
+                log.debug(f"info reply: seq mismatch (got {seq_id}, using {fallback_seq})")
+                seq_id = fallback_seq
+
+        if entry:
+            await self._process_info_reply(seq_id, subtype, success, payload, entry)
+            return
+
+        # 3. Проверяем pending_search по seq_id
+        if seq_id in self._pending_search:
+            await self._process_search_reply(seq_id, subtype, success, payload)
+            return
+
+        log.debug(f"ICQ meta seq={seq_id}: no pending request found")
 
     async def _process_info_reply(self, seq_id: int, subtype: int,
                                   success: int, payload: bytes,
@@ -3161,6 +3285,7 @@ class ICQClient:
                 c.status      = Status.OFFLINE
                 c.xstatus     = ""
                 c.xstatus_msg = ""
+                c.client      = "Unknown"
                 log.info(f"[OFFLINE] {uin} ({c.display_name})")
                 await self._fire(self.on_contact_offline, c)
             else:
