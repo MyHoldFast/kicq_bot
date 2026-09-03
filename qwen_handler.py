@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import html
 import asyncio
 import aiohttp
 import logging
@@ -10,7 +11,9 @@ from dataclasses import dataclass
 
 
 def clean_qwen_response(text: str) -> str:
+    text = html.unescape(text)
     text = re.sub(r'<details>.*?</details>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<!--\s*qwen_metadata:.*?-->', '', text, flags=re.DOTALL)
     text = re.sub(r'\n\s*\n+', '\n', text)
     text = re.sub(r'Response ID: [a-f0-9-]+', '', text)
     text = re.sub(r'Request ID: [a-f0-9-]+', '', text)
