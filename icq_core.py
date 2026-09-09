@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import logging
 import struct
 import time, re
@@ -11,6 +12,7 @@ class AuthError(ConnectionError):
     pass
 SERVER = "195.66.114.37" 
 PORT   = 5190
+AIM_MD5_MAGIC = b"AOL Instant Messenger (SM)"
 ICQ_MAX_CHARS = 2000
 CAP_QIP2005          = bytes.fromhex("563FC8090B6F41514950203230303561")
 CAP_QIP_GENERIC      = bytes.fromhex("563FC8090B6F41514950202020202021")
@@ -798,11 +800,13 @@ def _extract_xtraz_xml_from_relay(data: bytes) -> Optional[str]:
         return None
 class ICQClient:
     def __init__(self, uin: str, password: str,
-                 server: str = SERVER, port: int = PORT):
+                 server: str = SERVER, port: int = PORT,
+                 use_md5_login: bool = False):
         self.uin      = uin
         self.password = password
         self.server   = server
         self.port     = port
+        self.use_md5_login = use_md5_login
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._seq    = 0
@@ -857,6 +861,15 @@ class ICQClient:
             log.info(f"Status changed to {status.label}: {message}")
     async def set_xstatus(self, name: str, title: str = "", desc: str = ""):
         name_lower = name.lower()
+        if not name_lower:
+            self._my_xstatus_name  = ""
+            self._my_xstatus_guid  = b""
+            self._my_xstatus_title = ""
+            self._my_xstatus_desc  = ""
+            if self._running:
+                await self._send_cli_setuserinfo()
+                log.info("xStatus cleared")
+            return
         guid_hex = XSTATUS_BY_NAME.get(name_lower, "")
         if not guid_hex:
             log.warning(f"Unknown xStatus name: {name}")
@@ -1396,13 +1409,9 @@ class ICQClient:
     async def request_xstatus(self, to_uin: str):
         ts      = int(time.time() * 1000) & 0xFFFFFFFF
         counter = int(time.time()) & 0xFFFF
-        payload_a = self._build_xtraz_request_payload(to_uin, counter, ts, 0)
-        await self._send_snac(0x0004, 0x0006, payload_a)
-        log.debug(f"xTraz request (A) sent to {to_uin}")
-        await asyncio.sleep(0.05)
-        payload_b = self._build_xtraz_request_payload_duck(to_uin, counter, ts, ts)
-        await self._send_snac(0x0004, 0x0006, payload_b)
-        log.debug(f"xTraz request (B) sent to {to_uin}")
+        payload = self._build_xtraz_request_payload(to_uin, counter, ts, 0)
+        await self._send_snac(0x0004, 0x0006, payload)
+        log.debug(f"xTraz request sent to {to_uin}")
     def _build_xtraz_request_payload(self, to_uin: str, counter: int,
                                       l1: int, l2: int) -> bytes:
         xml_str = (
@@ -1412,52 +1421,49 @@ class ICQClient:
             + _xml_escape(
                 "<srv><id>cAwaySrv</id>"
                 "<req><id>AwayStat</id>"
-                f"<trans>1</trans>"
+                f"<trans>2</trans>"
                 f"<senderId>{self.uin}</senderId>"
                 "</req></srv>"
             )
-            + "</NOTIFY></N>"
+            + "</NOTIFY></N>\r\n"
         )
         xml_b = xml_str.encode("ascii")
         k = len(xml_b)
         uin_b = to_uin.encode("ascii")
-        tlv2711_body = bytearray()
-        tlv2711_body += struct.pack("<H", 27)
-        tlv2711_body += b"\x08"
-        tlv2711_body += b"\x00" * 16
-        tlv2711_body += struct.pack("<I", 3)
-        tlv2711_body += struct.pack("<I", 0)
-        tlv2711_body += struct.pack("<H", counter)
-        tlv2711_body += struct.pack("<H", 14)
-        tlv2711_body += struct.pack("<H", counter)
-        tlv2711_body += b"\x00" * 12
-        tlv2711_body += b"\x1a\x00"
-        tlv2711_body += struct.pack("<H", 0)
-        tlv2711_body += struct.pack("!H", 256)
-        assert len(tlv2711_body) == 51, f"TLV 2711 body должен быть 51, получили {len(tlv2711_body)}"
-        tlv2711 = struct.pack("!HH", 10001, 51 + k) + bytes(tlv2711_body)
-        part_a_small = struct.pack("<H", 1) + b"\x00"
-        part_b = bytearray()
-        part_b += struct.pack("<H", 79)
-        part_b += struct.pack("<I", 0x3b60b3ef)
-        part_b += struct.pack("<I", 0xd82a6c45)
-        part_b += struct.pack("<I", 0xa4e09c5a)
-        part_b += struct.pack("<I", 0x5e67e865)
-        part_b += struct.pack("<H", 8)
-        part_b += struct.pack("<I", 42)
-        part_b += b"Script Plug-in: Remote Notification Arrive"
-        part_b += struct.pack("!I", 256)
-        part_b += struct.pack("!I", 0)
-        part_b += struct.pack("!I", 0)
-        part_b += struct.pack("!H", 0)
-        part_b += b"\x00"
-        xml_payload = bytearray()
-        xml_payload += struct.pack("<H", k + 4)
-        xml_payload += struct.pack("<H", 0)
-        xml_payload += struct.pack("<H", k)
-        xml_payload += struct.pack("<H", 0)
-        xml_payload += xml_b
-        trailer = struct.pack("!I", 0x00030000)
+        body = bytearray()
+        body += struct.pack("<H", 27)
+        body += b"\x0a"
+        body += b"\x00" * 16
+        body += struct.pack(">I", 3)
+        body += struct.pack(">I", 0)
+        body += struct.pack("<H", counter)
+        body += struct.pack("<H", 14)
+        body += struct.pack("<H", counter)
+        body += b"\x00" * 12
+        body += b"\x1a\x00"
+        body += struct.pack("<H", 0)
+        body += struct.pack("!H", 256)
+        body += struct.pack("<H", 1)
+        body += b"\x00"
+        body += struct.pack("<H", 79)
+        body += struct.pack(">I", 0x3b60b3ef)
+        body += struct.pack(">I", 0xd82a6c45)
+        body += struct.pack(">I", 0xa4e09c5a)
+        body += struct.pack(">I", 0x5e67e865)
+        body += struct.pack("<H", 8)
+        body += struct.pack("<I", 42)
+        body += b"Script Plug-in: Remote Notification Arrive"
+        body += struct.pack("!I", 256)
+        body += struct.pack("!I", 0)
+        body += struct.pack("!I", 0)
+        body += struct.pack("!H", 0)
+        body += b"\x00"
+        body += struct.pack("<H", k + 4)
+        body += struct.pack("<H", 0)
+        body += struct.pack("<H", k)
+        body += struct.pack("<H", 0)
+        body += xml_b
+        tlv2711 = struct.pack("!HH", 10001, len(body)) + bytes(body)
         tlv5_body = bytearray()
         tlv5_body += struct.pack("!H", 0x0000)
         tlv5_body += struct.pack("<I", l1)
@@ -1469,10 +1475,6 @@ class ICQClient:
         tlv5_body += struct.pack("!HHH", 0x000A, 0x0002, 0x0001)
         tlv5_body += struct.pack("!HH", 0x000F, 0x0000)
         tlv5_body += tlv2711
-        tlv5_body += part_a_small
-        tlv5_body += part_b
-        tlv5_body += xml_payload
-        tlv5_body += trailer
         tlv5 = struct.pack("!HH", 0x0005, len(tlv5_body)) + bytes(tlv5_body)
         payload = bytearray()
         payload += struct.pack("<I", l1)
@@ -1481,6 +1483,7 @@ class ICQClient:
         payload += struct.pack("B", len(uin_b))
         payload += uin_b
         payload += tlv5
+        payload += struct.pack("!I", 0x00030000)
         return bytes(payload)
     def _build_xtraz_request_payload_duck(self, to_uin: str, counter: int,
                                            l1: int, l2: int) -> bytes:
@@ -1604,7 +1607,7 @@ class ICQClient:
         pos = put_le(pos, 0x0001)
         pos = put_byte(pos, 0x00)
         pos = put_le(pos, 79)
-        magic = bytes.fromhex("efb3603b456c2ad85a9ce0a465e8675e")
+        magic = bytes.fromhex("3b60b3efd82a6c45a4e09c5a5e67e865")
         buf[pos:pos+16] = magic; pos += 16
         pos = put_le(pos, 8)
         pos = put_dword_le(pos, 42)
@@ -1669,7 +1672,7 @@ class ICQClient:
         pos = put_le(pos, 0x0001)
         pos = put_byte(pos, 0x00)
         pos = put_le(pos, 79)
-        magic = bytes.fromhex("efb3603b456c2ad85a9ce0a465e8675e")
+        magic = bytes.fromhex("3b60b3efd82a6c45a4e09c5a5e67e865")
         buf[pos:pos+16] = magic; pos += 16
         pos = put_dword_le(pos, 8)
         pos = put_dword_le(pos, 42)
@@ -1701,7 +1704,7 @@ class ICQClient:
             keepalive_task = None
             try:
                 await self._connect()
-                recon = await self._login_stage1()
+                recon = await (self._login_stage1_md5() if self.use_md5_login else self._login_stage1())
             except AuthError as e:
                 log.error(f"Auth error: {e}")
                 self._running = False
@@ -1793,6 +1796,49 @@ class ICQClient:
                    + _make_tlv(1, self.uin.encode())
                    + _make_tlv(2, _xor_password(self.password)))
         await self._send_flap(1, payload)
+        return await self._finish_channel1_login()
+    async def _login_stage1_md5(self) -> str:
+        await self._recv_flap(timeout=10.0)
+        await self._send_snac(0x0017, 0x0006, _make_tlv(1, self.uin.encode()))
+        _, _, key_body = await self._recv_flap(timeout=10.0)
+        if len(key_body) < 12:
+            raise AuthError("Auth failed: bad key response")
+        fam, sub = struct.unpack_from("!HH", key_body, 0)
+        if fam != 0x0017 or sub != 0x0007:
+            raise AuthError("Auth failed: unexpected key response")
+        klen = struct.unpack_from("!H", key_body, 10)[0]
+        key = key_body[12:12 + klen]
+        pw_digest = hashlib.md5(self.password.encode("cp1251", errors="replace")).digest()
+        digest = hashlib.md5(key + pw_digest + AIM_MD5_MAGIC).digest()
+        client_string = b"ICQ Inc. - Product of ICQ (TM).2000b.4.65.1.3281.85"
+        payload = (_make_tlv(1, self.uin.encode())
+                   + _make_tlv(0x25, digest)
+                   + _make_tlv(0x4C, b"\x00\x00")
+                   + _make_tlv(3, client_string)
+                   + _make_tlv(0x16, b"\x01\x0A")
+                   + _make_tlv(0x17, b"\x00\x04")
+                   + _make_tlv(0x18, b"\x00\x41")
+                   + _make_tlv(0x19, b"\x00\x01")
+                   + _make_tlv(0x1A, b"\x0C\xD1")
+                   + _make_tlv(0x14, struct.pack("!I", 0x55))
+                   + _make_tlv(0x0F, b"en")
+                   + _make_tlv(0x0E, b"us")
+                   + _make_tlv(0x4A, b"\x01"))
+        await self._send_snac(0x0017, 0x0002, payload)
+        _, _, reply_body = await self._recv_flap(timeout=10.0)
+        if len(reply_body) < 10:
+            raise AuthError("Auth failed: bad login reply")
+        tlvs = _parse_tlvs(reply_body[10:])
+        if 0x0008 in tlvs:
+            err_code = struct.unpack_from("!H", tlvs[0x0008])[0] if len(tlvs[0x0008]) >= 2 else 0
+            raise AuthError(f"Auth failed: server error code {err_code:#06x}")
+        self._cookie = tlvs.get(6)
+        if not self._cookie:
+            raise AuthError("Auth failed: no cookie")
+        recon = tlvs.get(5, b"").decode(errors="ignore")
+        log.info(f"Auth OK (MD5), BOS={recon}")
+        return recon
+    async def _finish_channel1_login(self) -> str:
         _, _, body = await self._recv_flap(timeout=10.0)
         tlvs = _parse_tlvs(body)
         if 0x0008 in tlvs:
@@ -2362,7 +2408,7 @@ class ICQClient:
             await self._fire(self.on_contact_status, c)
             if not was_online:
                 await self._fire(self.on_contact_online, c)
-            if xstatus_name:
+            if xstatus_name and not xstatus_msg:
                 task = asyncio.create_task(self._request_xstatus_safe(uin))
                 self._message_tasks.add(task)
                 task.add_done_callback(self._message_tasks.discard)
@@ -2370,6 +2416,10 @@ class ICQClient:
             log.error(f"buddy_online parse error: {e}", exc_info=True)
     async def _request_xstatus_safe(self, uin: str):
         await asyncio.sleep(0.3)
+        c = self.contacts.get(uin)
+        if c and c.xstatus_msg:
+            log.debug(f"xTraz request for {uin} skipped: xstatus_msg already set (new-style TLV won the race)")
+            return
         try:
             await self.request_xstatus(uin)
         except Exception as e:
@@ -2415,14 +2465,6 @@ class ICQClient:
                     if xml_text:
                         log.debug(f"[msg A] xml_text from {sender}: {xml_text[:120]}")
                         result = _parse_xtraz_response(xml_text)
-                    if result is None:
-                        log.debug(f"[msg B] raw2711 from {sender}: {raw2711[:80]}")
-                        result = _parse_xtraz_response_bytes(raw2711)
-                    if result is None:
-                        raw_duck = self._extract_relay_xml_duck(data)
-                        if raw_duck is not None:
-                            log.debug(f"[msg C] raw_duck from {sender}: {raw_duck[:80]}")
-                            result = _parse_xtraz_response_bytes(raw_duck)
                     if result is not None:
                         title, desc = result
                         if sender:
@@ -2441,12 +2483,6 @@ class ICQClient:
                     xtraz_sender = None
                     if xml_text:
                         xtraz_sender = _parse_xtraz_request(xml_text)
-                    if not xtraz_sender:
-                        xtraz_sender = _parse_xtraz_request_bytes(raw2711)
-                    if not xtraz_sender:
-                        raw_duck = self._extract_relay_xml_duck(data)
-                        if raw_duck is not None:
-                            xtraz_sender = _parse_xtraz_request_bytes(raw_duck)
                     if xtraz_sender:
                         log.info(f"xTraz request (4/7) from {xtraz_sender}")
                         await self._send_xtraz_response(
@@ -2485,11 +2521,6 @@ class ICQClient:
             if xml_text:
                 log.debug(f"[relay A] xml from {sender}: {xml_text[:120]}")
                 result = _parse_xtraz_response(xml_text)
-            if result is None:
-                raw_duck = self._extract_relay_xml_duck(data)
-                if raw_duck is not None:
-                    log.debug(f"[relay B] raw_duck from {sender}: {raw_duck[:80]}")
-                    result = _parse_xtraz_response_bytes(raw_duck)
             if result is not None:
                 title, desc = result
                 c = self.contacts.get(sender)
@@ -2506,14 +2537,10 @@ class ICQClient:
                 else:
                     log.debug(f"[xTraz resp 4/11] unknown {sender}: '{title}'/'{desc}'")
                 return
-            if not xml_text and not self._extract_relay_xml_duck(data):
+            if not xml_text:
                 log.debug(f"[relay] no xml from {sender}")
                 return
-            xtraz_sender = _parse_xtraz_request(xml_text) if xml_text else None
-            if not xtraz_sender:
-                raw_duck = self._extract_relay_xml_duck(data)
-                if raw_duck is not None:
-                    xtraz_sender = _parse_xtraz_request_bytes(raw_duck)
+            xtraz_sender = _parse_xtraz_request(xml_text)
             if xtraz_sender:
                 log.info(f"xTraz request (4/11) from {xtraz_sender}")
                 await self._send_xtraz_response(
