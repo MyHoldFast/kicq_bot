@@ -251,6 +251,7 @@ class QwenHandler:
 
         max_retries = 10
         retry_delay = 2
+        context_cleared = False
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -277,7 +278,14 @@ class QwenHandler:
                                 logging.info(f"Chat in progress for user {user_id}, retrying...")
                                 await asyncio.sleep(retry_delay)
                                 continue
-                            return f"API error {response.status}"
+
+                        if response.status in (400, 429) and not context_cleared and attempt < max_retries:
+                            logging.warning(f"API error {response.status} for user {user_id}, clearing context and retrying...")
+                            self.clear_context(user_id)
+                            self._add_to_context(user_id, "user", message)
+                            json_data["messages"] = self._get_user_context(user_id)
+                            context_cleared = True
+                            continue
 
                         return f"API error {response.status}"
 
