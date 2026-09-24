@@ -595,7 +595,42 @@ def _extract_ch1_text(data: bytes, offset: int) -> Optional[str]:
                     return text_data.decode("utf-16-be", errors="replace").strip("\x00").strip()
                 return _decode_text(text_data) or None
     return None
+def _extract_ch2_text_struct(data: bytes) -> Optional[str]:
+    try:
+        pos = 10 + 8 + 2
+        pos += 1 + data[pos] + 4
+        raw5 = None
+        while pos + 4 <= len(data):
+            t, l = struct.unpack_from("!HH", data, pos); pos += 4
+            if t == 0x0005:
+                raw5 = data[pos:pos+l]
+                break
+            pos += l
+        if not raw5 or len(raw5) < 26 or raw5[:2] != b"\x00\x00":
+            return None
+        p, r = 26, None
+        while p + 4 <= len(raw5):
+            t, l = struct.unpack_from("!HH", raw5, p); p += 4
+            if t == 0x2711:
+                r = raw5[p:p+l]
+                break
+            p += l
+        if not r or len(r) < 20 or r[4:20] != b"\x00" * 16:
+            return None
+        p = 2 + struct.unpack_from("<H", r, 0)[0]
+        p += 2 + struct.unpack_from("<H", r, p)[0]
+        if p + 8 > len(r) or r[p] != 0x01:
+            return None
+        n = struct.unpack_from("<H", r, p + 6)[0]
+        return _decode_text(r[p+8:p+8+n]) or None
+    except Exception:
+        return None
 def _extract_ch2_text(data: bytes) -> Optional[str]:
+    text = _extract_ch2_text_struct(data)
+    if text:
+        return text
+    return _extract_ch2_text_legacy(data)
+def _extract_ch2_text_legacy(data: bytes) -> Optional[str]:
     try:
         pos = 10 + 8 + 2
         uin_len = data[pos]; pos += 1 + uin_len
@@ -2441,6 +2476,18 @@ class ICQClient:
                 log.debug(f"[OFFLINE] unknown uin {uin}")
         except Exception as e:
             log.error(f"buddy_offline parse error: {e}", exc_info=True)
+    async def _send_msg_ack_ch2(self, cookie: bytes, sender: str, r2711: bytes):
+        try:
+            uin_b = sender.encode("ascii")
+            p = 2 + struct.unpack_from("<H", r2711, 0)[0]
+            p += 2 + struct.unpack_from("<H", r2711, p)[0]
+            body = (r2711[:p] + b"\x01\x00" + b"\x00\x00\x00\x00"
+                    + b"\x01\x00\x00" + b"\x00\x00\x00\x00\xff\xff\xff\x00")
+            payload = (cookie + b"\x00\x02" + bytes([len(uin_b)]) + uin_b
+                       + b"\x00\x03" + body)
+            await self._send_snac(0x0004, 0x000B, payload, reqid=0)
+        except Exception as e:
+            log.error(f"msg ack ch2 send error: {e}")
     async def _send_msg_ack(self, cookie: bytes, channel: int, sender: str):
         try:
             uin_b = sender.encode("ascii")
@@ -2499,6 +2546,10 @@ class ICQClient:
                 text = _extract_ch1_text(data, pos + 4)
             elif channel == 2:
                 text = _extract_ch2_text(data)
+                if text and _extract_ch2_text_struct(data):
+                    raw2711 = self._extract_raw_2711(data)
+                    if raw2711 is not None:
+                        await self._send_msg_ack_ch2(cookie, sender, raw2711)
             elif channel == 4:
                 text = _extract_ch4_text(data, pos)
             if not text:
