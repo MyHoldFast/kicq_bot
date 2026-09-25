@@ -20,11 +20,10 @@ logging.basicConfig(
 async def main():
     UIN          = os.environ["UIN"]
     PASSWORD     = os.environ["PASSWORD"]
-    QWEN_API_KEY = os.environ["QWEN_API_KEY"]
+    DEEPSEEK_TOKEN = os.environ["DEEPSEEK_TOKEN"]
 
     command_handler = CommandHandler()
-    command_handler.register_qwen(QWEN_API_KEY)
-    logging.info("Qwen AI handler registered")
+    command_handler.register_deepseek(DEEPSEEK_TOKEN)
     command_handler.load_commands_from_directory("handlers")
 
     handle_typing = sys.modules["rooms"].handle_typing

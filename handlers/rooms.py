@@ -292,12 +292,12 @@ async def _run_public_command_in_room(bot, uin: str, command: str, args: str):
 
 # ── Обработчики команд ────────────────────────────────────────────────────────
 
-async def qwen_room_command(bot, uin: str, args: str) -> str:
+async def deepseek_room_command(bot, uin: str, args: str) -> str:
     if not args.strip():
-        return "Использование: /qwen <вопрос>"
-    if not _command_handler or not _command_handler.get_qwen():
-        return "Qwen недоступен."
-    return await _command_handler.call_qwen(uin, args)
+        return "Использование: /ds <вопрос>"
+    if not _command_handler or not _command_handler.get_deepseek():
+        return "DeepSeek недоступен."
+    return await _command_handler.call_deepseek(uin, args)
 
 
 async def nick_command(bot, uin: str, args: str) -> str:
@@ -501,12 +501,14 @@ def setup(handler):
     handler.register_command("leave",  leave_command,
                              help_text="/leave - выйти из комнаты",
                              group="Чат-комнаты")
-    handler.register_command("qwen",   qwen_room_command,
-                             help_text="/qwen <вопрос> - спросить у Qwen (видно всем в комнате)",
+    handler.register_command("ds",     deepseek_room_command,
+                             help_text="/ds <вопрос> - спросить у DeepSeek (видно всем в комнате)",
                              group="Чат-комнаты")
+    handler.register_command("deepseek", deepseek_room_command)
 
     handler.room_public_commands.add("weather")
-    handler.room_public_commands.add("qwen")
+    handler.room_public_commands.add("ds")
+    handler.room_public_commands.add("deepseek")
     logging.info(f"ChatRooms: room_public_commands = {handler.room_public_commands}")
 
     handler.set_default_handler(chat_message_handler)

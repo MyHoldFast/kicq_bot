@@ -35,7 +35,7 @@ class CommandHandler:
     def __init__(self):
         self.commands: Dict[str, Callable] = {}
         self.default_handler: Optional[Callable] = None
-        self.qwen = None
+        self.deepseek = None
         self.bot = None
         self.active_requests: Dict[str, asyncio.Task] = {}
         self.room_public_commands: Set[str] = set()
@@ -86,25 +86,23 @@ class CommandHandler:
                     lines.append(f"  {text}")
                 lines.append("")
 
-        lines.append("Qwen отвечает сам, когда пишете в личку.")
-        lines.append("В общей комнате: /qwen <вопрос>")
+        lines.append("DeepSeek отвечает сам, когда пишете в личку.")
+        lines.append("В общей комнате: /ds <вопрос>")
         lines.append("/weather <город>")
         return "\n".join(lines).strip()
 
     def set_default_handler(self, handler: Callable):
         self.default_handler = handler
 
-    def register_qwen(self, api_key: str):
-        from qwen_handler import QwenHandler
-        self.qwen = QwenHandler(api_key=api_key)
+    def register_deepseek(self, token: str):
+        from deepseek_handler import DeepSeekHandler
+        self.deepseek = DeepSeekHandler(token)
 
-    def get_qwen(self):
-        """Публичный метод для доступа к Qwen из других модулей."""
-        return self.qwen
+    def get_deepseek(self):
+        return self.deepseek
 
-    async def call_qwen(self, user_id: str, message: str) -> Optional[str]:
-        """Публичный метод для вызова Qwen из других модулей."""
-        return await self._call_qwen(user_id, message)
+    async def call_deepseek(self, user_id: str, message: str) -> Optional[str]:
+        return await self._call_deepseek(user_id, message)
 
     def load_commands_from_directory(self, directory: str):
         if not os.path.exists(directory):
@@ -135,21 +133,21 @@ class CommandHandler:
         logging.info(f"New user: {user_id}")
         return True
 
-    async def _call_qwen(self, user_id: str, message: str) -> Optional[str]:
-        if not self.qwen:
+    async def _call_deepseek(self, user_id: str, message: str) -> Optional[str]:
+        if not self.deepseek:
             return None
         if user_id in self.active_requests:
             task = self.active_requests[user_id]
             if not task.done():
                 return "Подождите, предыдущий запрос ещё обрабатывается..."
-        task = asyncio.create_task(self.qwen.process_message(user_id, message))
+        task = asyncio.create_task(self.deepseek.process_message(user_id, message))
         self.active_requests[user_id] = task
         try:
             return await task
         except asyncio.CancelledError:
             return "Запрос отменён."
         except Exception as e:
-            logging.error(f"Qwen processing error: {e}")
+            logging.error(f"DeepSeek processing error: {e}")
             return f"Ошибка: {e}"
         finally:
             self.active_requests.pop(user_id, None)
@@ -176,8 +174,8 @@ class CommandHandler:
                     logging.error(f"Default handler error (public command): {e}")
                     return f"Error: {str(e)}"
 
-            if command == "qwen":
-                return await self._call_qwen(user_id, args)
+            if command in ("ds", "deepseek"):
+                return await self._call_deepseek(user_id, args)
 
             if command in self.commands:
                 handler = self.commands[command]
@@ -203,7 +201,7 @@ class CommandHandler:
                 logging.error(f"Default handler error: {e}")
                 return f"Error: {str(e)}"
 
-        return await self._call_qwen(user_id, message)
+        return await self._call_deepseek(user_id, message)
 
 
 def admin_only(func=None):
