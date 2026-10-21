@@ -94,23 +94,38 @@ class DeepSeekAPI:
             raise APIError(f"API request failed: {response.text}", response.status_code)
 
         try:
-            return response.json()
+            payload = response.json()
         except json.JSONDecodeError:
             raise APIError("Invalid JSON response from server")
+        if not isinstance(payload, dict):
+            raise APIError(f"Unexpected response: {response.text[:200]}")
+
+        data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+        code = payload.get('code') or 0
+        biz_code = data.get('biz_code') or 0
+        msg = payload.get('msg') or data.get('biz_msg') or ''
+        if code in (40001, 40002, 40003) or biz_code in (40001, 40002, 40003):
+            raise AuthenticationError(msg or "Invalid or expired authentication token")
+        if code or biz_code:
+            raise APIError(f"API error {code or biz_code}: {msg}", response.status_code)
+
+        biz_data = data.get('biz_data')
+        if not isinstance(biz_data, dict):
+            raise APIError(f"Unexpected response: {response.text[:200]}")
+        return biz_data
 
     def _get_pow_challenge(self) -> Dict[str, Any]:
-        response = self._make_request('POST', '/chat/create_pow_challenge', {'target_path': '/api/v0/chat/completion'})
-        try:
-            return response['data']['biz_data']['challenge']
-        except KeyError:
-            raise APIError("Invalid challenge response format from server")
+        biz = self._make_request('POST', '/chat/create_pow_challenge', {'target_path': '/api/v0/chat/completion'})
+        if not isinstance(biz.get('challenge'), dict):
+            raise APIError(f"Invalid challenge response: {json.dumps(biz)[:200]}")
+        return biz['challenge']
 
     def create_chat_session(self) -> str:
-        response = self._make_request('POST', '/chat_session/create', {'character_id': None})
-        try:
-            return response['data']['biz_data']['id']
-        except KeyError:
-            raise APIError("Invalid session creation response format from server")
+        biz = self._make_request('POST', '/chat_session/create', {'character_id': None})
+        session = biz.get('chat_session') if isinstance(biz.get('chat_session'), dict) else biz
+        if not session.get('id'):
+            raise APIError(f"Invalid session creation response: {json.dumps(biz)[:200]}")
+        return session['id']
 
     def delete_chat_session(self, chat_session_id: str) -> str:
         self._make_request('POST', '/chat_session/delete', {'chat_session_id': chat_session_id})
@@ -161,6 +176,13 @@ class DeepSeekAPI:
 
         state = {'path': None, 'fragments': []}
         for line in response.iter_lines():
+            if line and line.startswith(b'{'):
+                try:
+                    err = json.loads(line)
+                except json.JSONDecodeError:
+                    err = None
+                if isinstance(err, dict) and err.get('code'):
+                    raise APIError(f"API error {err['code']}: {err.get('msg', '')}")
             if not line or not line.startswith(b'data: '):
                 continue
             try:
